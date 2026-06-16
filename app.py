@@ -53,6 +53,21 @@ def load_data():
     for v in DEFAULT_VARS:
         if v["token"] not in have:
             d.setdefault("variables", []).append(dict(v))
+    # миграция старых типов: гарантируем наличие var_tokens
+    for ct in d.get("custom_types", []):
+        if "var_tokens" not in ct:
+            toks = []
+            for f in ct.get("fields", []):
+                tok = f.get("key") or f.get("token")
+                if not tok:
+                    continue
+                toks.append(tok)
+                if not any(v["token"] == tok for v in d.get("variables", [])):
+                    d.setdefault("variables", []).append(
+                        {"token": tok, "label": f.get("label", tok), "type": f.get("type", "text")})
+            ct["var_tokens"] = toks
+        ct.pop("fields", None)
+    d.setdefault("extra_tokens", {})
     return d
 
 
@@ -132,14 +147,32 @@ def add_token_to_type(t, tok):
             lst.append(tok)
     else:
         ct = next(c for c in D()["custom_types"] if c["key"] == t["key"])
+        ct.setdefault("var_tokens", [])
         if tok not in ct["var_tokens"]:
             ct["var_tokens"].append(tok)
 
 
+def remove_token_from_type(t, tok):
+    """Убирает переменную из набора документа (базовые встроенные не трогаем)."""
+    if t["builtin"]:
+        lst = D().setdefault("extra_tokens", {}).get(t["key"], [])
+        if tok in lst:
+            lst.remove(tok)
+    else:
+        ct = next(c for c in D()["custom_types"] if c["key"] == t["key"])
+        if tok in ct.get("var_tokens", []):
+            ct["var_tokens"].remove(tok)
+
+
 def text_of(tk):
     if tk in D()["texts"]:
-        return D()["texts"][tk]
-    return BUILTINS[tk]["default_text"] if tk in BUILTINS else ""
+        v = D()["texts"][tk]
+    else:
+        v = BUILTINS[tk]["default_text"] if tk in BUILTINS else ""
+    if isinstance(v, dict):  # на случай ранее сохранённого объекта {text, cmd}
+        v = v.get("text", "")
+        D()["texts"][tk] = v
+    return v if isinstance(v, str) else ""
 
 
 def vars_panel(t):
@@ -337,7 +370,8 @@ def preview_html(text, ctx, client, with_table=True):
 st.set_page_config(page_title="Go Offer Docs", page_icon="📄", layout="wide")
 if "data" not in st.session_state:
     st.session_state.data = load_data()
-for k, v in [("type", "freeze"), ("section", "create"), ("step", 1), ("editor_nonce", 0)]:
+for k, v in [("type", "freeze"), ("section", "create"), ("step", 1), ("editor_nonce", 0),
+             ("last_cmd_id", None)]:
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -444,10 +478,20 @@ elif sec == "template":
         ct["name"] = st.text_input("Название типа документа", ct["name"])
 
     st.markdown("**Текст документа** — таблица подписей добавляется автоматически в конце.")
-    new_text = template_editor(text=text_of(t["key"]), variables=vars_panel(t),
-                               key=f"editor_{t['key']}_{st.session_state.editor_nonce}")
-    if new_text is not None:
-        D()["texts"][t["key"]] = new_text
+    ret = template_editor(text=text_of(t["key"]), variables=vars_panel(t),
+                          key=f"editor_{t['key']}_{st.session_state.editor_nonce}")
+    if isinstance(ret, dict):
+        txt = ret.get("text")
+        if txt is not None:
+            D()["texts"][t["key"]] = txt
+        cmd = ret.get("cmd")
+        if cmd and cmd.get("id") and cmd.get("id") != st.session_state.get("last_cmd_id"):
+            st.session_state["last_cmd_id"] = cmd["id"]
+            if cmd.get("action") == "del" and cmd.get("token"):
+                remove_token_from_type(t, cmd["token"])
+                save_data(); st.rerun()
+    elif ret is not None:
+        D()["texts"][t["key"]] = ret
 
     with st.expander("➕ Добавить / создать переменную"):
         cur_toks = all_tokens(t)
@@ -494,19 +538,6 @@ elif sec == "template":
             if st.button("Добавить", key=f"addex_{t['key']}"):
                 tok = avail[opts.index(choice) - 1]["token"]
                 add_token_to_type(t, tok); save_data(); st.rerun()
-
-        removable = extra_tokens(t) if t["builtin"] else t["var_tokens"]
-        if removable:
-            st.caption("Удалить добавленную переменную:")
-            for i, tok in enumerate(list(removable)):
-                cc = st.columns([5, 1])
-                v = var_get(tok)
-                extra_lbl = ""
-                if v["type"] == "calc_date":
-                    extra_lbl = f"  (= {{{v.get('base')}}} + {{{v.get('dur')}}})"
-                cc[0].markdown(f"`{{{tok}}}` — {v['label']}{extra_lbl}")
-                if cc[1].button("🗑", key=f"rmv_{t['key']}_{i}"):
-                    removable.remove(tok); save_data(); st.rerun()
 
     a1, a2 = st.columns(2)
     with a1:
