@@ -231,29 +231,35 @@ def _set_table_borders(table):
     tblPr.append(borders)
 
 
-def _signature_table(doc, provider_name: str, provider_ein: str, client_name: str):
+# Таблица подписей одинакова во всех документах.
+SIG_PROVIDER_NAME = "Go Offer Inc"
+SIG_PROVIDER_EIN = "EIN: 93-4028120"
+
+
+def _signature_table(doc, client_name: str):
+    # (left, right, header?, кол-во пустых строк под заполнение)
     rows = [
-        ("Provider", "Client", True),
-        (provider_name, f"Full Name: {client_name}", False),
-        (provider_ein, "Passport/Driving License:", False),
-        ("Signature:", "Signature:", False),
-        ("Date:", "Date:", False),
+        ("Provider", "Client", True, 0),
+        (SIG_PROVIDER_NAME, f"Full Name: {client_name}", False, 2),
+        (SIG_PROVIDER_EIN, "Passport/Driving License:", False, 2),
+        ("Signature:", "Signature:", False, 4),
+        ("Date:", "Date:", False, 2),
     ]
     table = doc.add_table(rows=len(rows), cols=2)
     table.autofit = True
     _set_table_borders(table)
-    for ri, (left, right, hdr) in enumerate(rows):
+    for ri, (left, right, hdr, blanks) in enumerate(rows):
         for ci, txt in enumerate((left, right)):
             cell = table.cell(ri, ci)
             cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.LEFT
             run = cell.paragraphs[0].add_run(txt)
             run.bold = hdr
-            if ri >= 3:
+            for _ in range(blanks):
                 cell.add_paragraph()
     return table
 
 
-def build_docx(text: str, ctx: dict, provider_name: str, provider_ein: str, client_name: str) -> bytes:
+def build_docx(text: str, ctx: dict, client_name: str) -> bytes:
     doc = Document()
     style = doc.styles["Normal"]
     style.font.name = "Arial"
@@ -280,7 +286,7 @@ def build_docx(text: str, ctx: dict, provider_name: str, provider_ein: str, clie
             _add_runs(p, line, ctx)
 
     doc.add_paragraph()
-    _signature_table(doc, _sub(provider_name, ctx), _sub(provider_ein, ctx), client_name)
+    _signature_table(doc, client_name)
 
     buf = io.BytesIO(); doc.save(buf)
     return buf.getvalue()
