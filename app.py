@@ -477,7 +477,8 @@ if sec == "create":
             cols = st.columns(len(mt))
             for col, (lbl, val) in zip(cols, mt):
                 col.metric(lbl, val)
-        st.markdown(preview_html(text_of(t["key"]), ctx, client, True), unsafe_allow_html=True)
+        st.markdown(preview_html(text_of(t["key"]), ctx, client, True, highlight_vars=True),
+                    unsafe_allow_html=True)
         st.write("")
         docx_bytes = E.build_docx(text_of(t["key"]), ctx, client)
         fname = f"{E.safe_name(client)}_{t['key']}"
