@@ -29,6 +29,7 @@ DEFAULT_VARS = [
     {"token": "extension_months", "label": "Продление (месяцев)", "type": "number"},
     {"token": "new_expiration", "label": "Новая дата окончания (продление)", "type": "date"},
 ]
+DEFAULT_TOKENS = {v["token"] for v in DEFAULT_VARS}
 
 BUILTINS = {
     "freeze": {"name": "Official Freeze Form", "kind": "freeze", "default_text": E.FREEZE_TEXT,
@@ -162,6 +163,36 @@ def remove_token_from_type(t, tok):
         ct = next(c for c in D()["custom_types"] if c["key"] == t["key"])
         if tok in ct.get("var_tokens", []):
             ct["var_tokens"].remove(tok)
+
+
+def variable_usage(token):
+    """Где используется переменная: [(имя типа, кол-во в тексте, есть в полях)]."""
+    res = []
+    for t in all_types():
+        txt = text_of(t["key"])
+        cnt = txt.count("{" + token + "}") if isinstance(txt, str) else 0
+        intok = token in all_tokens(t)
+        if cnt > 0 or intok:
+            res.append((t["name"], cnt, intok))
+    return res
+
+
+def delete_variable_everywhere(token):
+    """Полное удаление: из реестра, из всех типов и из всех текстов."""
+    toks = {token}
+    for v in variables():  # каскад: вычисляемые даты, ссылающиеся на токен
+        if v.get("type") == "calc_date" and (v.get("base") == token or v.get("dur") == token):
+            toks.add(v["token"])
+    D()["variables"] = [v for v in variables() if v["token"] not in toks]
+    for ct in D()["custom_types"]:
+        ct["var_tokens"] = [x for x in ct.get("var_tokens", []) if x not in toks]
+    for k in list(D().get("extra_tokens", {}).keys()):
+        D()["extra_tokens"][k] = [x for x in D()["extra_tokens"][k] if x not in toks]
+    for k, txt in list(D()["texts"].items()):
+        if isinstance(txt, str):
+            for tk in toks:
+                txt = txt.replace("{" + tk + "}", "")
+            D()["texts"][k] = txt
 
 
 def text_of(tk):
@@ -332,8 +363,15 @@ def metrics_of(t, ctx):
 
 
 # ---------------- предпросмотр (HTML) ----------------
-def preview_html(text, ctx, client, with_table=True):
+def preview_html(text, ctx, client, with_table=True, highlight_vars=False):
     import re, html as _h
+    def _repl(m):
+        tok = m.group(1)
+        val = ctx.get(tok, m.group(0))
+        if highlight_vars:
+            return ('<span style="background:#ede9fe;color:#7c3aed;border-radius:4px;'
+                    'padding:0 4px;">' + _h.escape(str(val)) + '</span>')
+        return _h.escape(str(val))
     out = []
     for raw in (text or "").split("\n"):
         line = raw.rstrip("\r")
@@ -348,7 +386,7 @@ def preview_html(text, ctx, client, with_table=True):
         h = _h.escape(content)
         h = re.sub(r"\*\*([^*]+?)\*\*", r"<strong>\1</strong>", h)
         h = re.sub(r"\*([^*]+?)\*", r"<em>\1</em>", h)
-        h = re.sub(r"\{(\w+)\}", lambda m: _h.escape(str(ctx.get(m.group(1), m.group(0)))), h)
+        h = re.sub(r"\{(\w+)\}", _repl, h)
         out.append(f'<div style="{sty}">{h or "&nbsp;"}</div>')
     body = "".join(out)
     if with_table:
@@ -371,7 +409,7 @@ st.set_page_config(page_title="Go Offer Docs", page_icon="📄", layout="wide")
 if "data" not in st.session_state:
     st.session_state.data = load_data()
 for k, v in [("type", "freeze"), ("section", "create"), ("step", 1), ("editor_nonce", 0),
-             ("last_cmd_id", None)]:
+             ("last_cmd_id", None), ("pending_del_var", None)]:
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -539,6 +577,42 @@ elif sec == "template":
                 tok = avail[opts.index(choice) - 1]["token"]
                 add_token_to_type(t, tok); save_data(); st.rerun()
 
+    with st.expander("🗑 Удалить переменную совсем (из всех документов)"):
+        deletable = [v for v in variables() if v["token"] not in DEFAULT_TOKENS]
+        if not deletable:
+            st.caption("Своих переменных пока нет. Системные переменные удалять нельзя.")
+        else:
+            labels = [f"{v['label']}  ·  {{{v['token']}}}" for v in deletable]
+            dv = st.selectbox("Переменная", labels, key="delsel")
+            dtok = deletable[labels.index(dv)]["token"]
+            if st.button("Удалить переменную везде", key="delbtn"):
+                st.session_state.pending_del_var = dtok
+                st.rerun()
+
+    if st.session_state.get("pending_del_var"):
+        tok = st.session_state.pending_del_var
+        if any(v["token"] == tok for v in variables()):
+            usage = variable_usage(tok)
+            if usage:
+                used = ", ".join(f"«{n}» (×{c} в тексте)" for n, c, _ in usage)
+            else:
+                used = "нигде"
+            st.warning(f"Точно удалить переменную **{{{tok}}}**?\n\n"
+                       f"Используется в: {used}.\n\n"
+                       f"Она будет удалена из всех документов и убрана из всех текстов. "
+                       f"Это действие необратимо.")
+            cc = st.columns(2)
+            if cc[0].button("Да, удалить везде", type="primary", key="del_yes"):
+                delete_variable_everywhere(tok)
+                st.session_state.pending_del_var = None
+                st.session_state.editor_nonce += 1
+                save_data(); st.rerun()
+            if cc[1].button("Отмена", key="del_no"):
+                st.session_state.pending_del_var = None
+                st.rerun()
+        else:
+            st.session_state.pending_del_var = None
+
     a1, a2 = st.columns(2)
     with a1:
         if st.button("💾 Сохранить шаблон", type="primary", use_container_width=True):
@@ -550,8 +624,9 @@ elif sec == "template":
             save_data(); st.rerun()
 
     st.markdown("**Предпросмотр**")
-    ph = {tok: f"‹{lbl}›" for tok, lbl in vars_panel(t)}
-    st.markdown(preview_html(text_of(t["key"]), ph, "‹Имя клиента›", False), unsafe_allow_html=True)
+    ph = {tok: lbl for tok, lbl in vars_panel(t)}
+    st.markdown(preview_html(text_of(t["key"]), ph, "Имя клиента", False, highlight_vars=True),
+                unsafe_allow_html=True)
 
 # ===== СОЗДАННЫЕ =====
 elif sec == "created":

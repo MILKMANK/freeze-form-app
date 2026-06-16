@@ -1,8 +1,10 @@
 """
 Встроенный редактор шаблона (кастомный Streamlit-компонент).
-Слева: форматирование (Ж/К/H1/H2) + текст. Справа: переменные столбцом —
-клик вставляет по курсору; показан счётчик использований; мусорка удаляет
-переменную (убирает все её вхождения из текста и шлёт команду удаления в Python).
+- Форматирование (Ж/К/H1/H2), текст.
+- Переменные {token} подсвечиваются сиреневой «пилюлей» прямо в тексте
+  (подложка под прозрачным textarea).
+- Справа переменные столбцом: клик вставляет по курсору, показан счётчик
+  использований, мусорка удаляет (из текста + команда в Python).
 Возвращает объект {text, cmd}.
 """
 import os, tempfile
@@ -19,16 +21,23 @@ _HTML = r"""<!doctype html><html><head><meta charset="utf-8">
   .tb button{border:1px solid #c9ccd1;background:#fff;border-radius:6px;padding:4px 10px;
     cursor:pointer;font-size:13px;color:#111;}
   .tb button:hover{background:#f3f4f6;}
-  textarea{width:100%;box-sizing:border-box;min-height:380px;font-family:ui-monospace,
-    SFMono-Regular,Menlo,monospace;font-size:13px;line-height:1.55;padding:12px;
-    border:1px solid #c9ccd1;border-radius:8px;resize:vertical;}
+  .edwrap{position:relative;}
+  .backdrop,.ta{box-sizing:border-box;width:100%;min-height:380px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;line-height:1.55;
+    padding:12px;border:1px solid transparent;border-radius:8px;
+    white-space:pre-wrap;word-wrap:break-word;overflow-wrap:break-word;}
+  .backdrop{position:absolute;inset:0;color:#1a1a1a;overflow:hidden;pointer-events:none;
+    background:transparent;margin:0;}
+  .ta{position:relative;background:transparent;color:transparent;caret-color:#111;
+    border:1px solid #c9ccd1;resize:vertical;display:block;}
+  .hl{background:#ede9fe;color:#7c3aed;border-radius:4px;padding:0 2px;}
   .vtitle{font-size:13px;font-weight:600;color:#444;margin:0 0 4px;}
   .vhint{font-size:11px;color:#999;margin:0 0 8px;}
-  .vcol{display:flex;flex-direction:column;gap:6px;max-height:420px;overflow:auto;padding-right:2px;}
+  .vcol{display:flex;flex-direction:column;gap:6px;max-height:430px;overflow:auto;padding-right:2px;}
   .chip{border:1px solid #d7dae0;background:#f6f7f9;border-radius:8px;padding:7px 10px;cursor:pointer;}
   .chip:hover{background:#eceff3;}
   .chiprow{display:flex;align-items:center;gap:8px;}
-  .chiprow code{color:#2563eb;font-size:12px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;}
+  .chiprow code{color:#7c3aed;font-size:12px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;}
   .cnt{font-size:11px;color:#888;background:#fff;border:1px solid #e2e5ea;border-radius:10px;
     padding:0 7px;line-height:18px;white-space:nowrap;}
   .del{border:none;background:transparent;cursor:pointer;font-size:14px;padding:0 2px;opacity:.55;}
@@ -44,38 +53,46 @@ _HTML = r"""<!doctype html><html><head><meta charset="utf-8">
         <button data-l="# " title="Заголовок">H1</button>
         <button data-l="## " title="Подзаголовок">H2</button>
       </div>
-      <textarea id="ta" spellcheck="false"></textarea>
+      <div class="edwrap">
+        <div id="bd" class="backdrop"></div>
+        <textarea id="ta" class="ta" spellcheck="false"></textarea>
+      </div>
     </div>
     <div class="right">
       <div class="vtitle">Переменные</div>
-      <div class="vhint">Клик — вставить по курсору. Мусорка — удалить из текста и из списка.</div>
+      <div class="vhint">Клик — вставить по курсору. Мусорка — удалить из текста и списка.</div>
       <div class="vcol" id="chips"></div>
     </div>
   </div>
 <script>
-  var inited=false, debTimer=null, pendingCmd=null, lastVars=[];
-  var ta=document.getElementById('ta');
+  var inited=false, debTimer=null, pendingCmd=null;
+  var ta=document.getElementById('ta'), bd=document.getElementById('bd');
   function post(type, extra){ var m={isStreamlitMessage:true,type:type};
     if(extra){for(var k in extra)m[k]=extra[k];} window.parent.postMessage(m,'*'); }
   function setHeight(){ post('streamlit:setFrameHeight',{height:document.body.scrollHeight+8}); }
   function sendValue(){ post('streamlit:setComponentValue',
     {value:{text:ta.value, cmd:pendingCmd}, dataType:'json'}); pendingCmd=null; }
-  function debounced(){ clearTimeout(debTimer); debTimer=setTimeout(sendValue,350); updateCounts(); setHeight(); }
+  function escHtml(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  function updateBackdrop(){
+    bd.innerHTML = escHtml(ta.value).replace(/\{(\w+)\}/g,'<span class="hl">{$1}</span>') + '\n';
+    bd.scrollTop = ta.scrollTop; bd.scrollLeft = ta.scrollLeft;
+  }
   function reEsc(s){ return s.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'); }
   function countOf(tok){ var m=ta.value.match(new RegExp('\\{'+reEsc(tok)+'\\}','g')); return m?m.length:0; }
+  function afterEdit(){ updateBackdrop(); updateCounts(); sendValue(); }
   function insertAtCursor(t){ var s=ta.selectionStart,e=ta.selectionEnd;
     ta.value=ta.value.slice(0,s)+t+ta.value.slice(e);
-    var np=s+t.length; ta.selectionStart=ta.selectionEnd=np; ta.focus(); sendValue(); updateCounts(); }
+    var np=s+t.length; ta.selectionStart=ta.selectionEnd=np; ta.focus(); afterEdit(); }
   function wrapSel(m){ var s=ta.selectionStart,e=ta.selectionEnd,sel=ta.value.slice(s,e)||'текст';
     ta.value=ta.value.slice(0,s)+m+sel+m+ta.value.slice(e);
-    ta.selectionStart=s+m.length; ta.selectionEnd=s+m.length+sel.length; ta.focus(); sendValue(); }
+    ta.selectionStart=s+m.length; ta.selectionEnd=s+m.length+sel.length; ta.focus(); afterEdit(); }
   function lineMark(m){ var s=ta.selectionStart, ls=ta.value.lastIndexOf('\n',s-1)+1;
     ta.value=ta.value.slice(0,ls)+m+ta.value.slice(ls);
-    ta.selectionStart=ta.selectionEnd=s+m.length; ta.focus(); sendValue(); }
+    ta.selectionStart=ta.selectionEnd=s+m.length; ta.focus(); afterEdit(); }
   function deleteVar(tok){
-    ta.value=ta.value.split('{'+tok+'}').join('');           // убрать все вхождения из текста
+    ta.value=ta.value.split('{'+tok+'}').join('');
     pendingCmd={id:String(Date.now())+Math.random(), action:'del', token:tok};
-    sendValue(); updateCounts();
+    afterEdit();
   }
   var btns=document.querySelectorAll('.tb button');
   for(var i=0;i<btns.length;i++){(function(b){
@@ -83,14 +100,15 @@ _HTML = r"""<!doctype html><html><head><meta charset="utf-8">
     b.onclick=function(){ if(b.getAttribute('data-w')) wrapSel(b.getAttribute('data-w'));
       else lineMark(b.getAttribute('data-l')); };
   })(btns[i]);}
-  ta.addEventListener('input', debounced);
+  ta.addEventListener('input', function(){ updateBackdrop(); updateCounts();
+    clearTimeout(debTimer); debTimer=setTimeout(sendValue,350); setHeight(); });
+  ta.addEventListener('scroll', function(){ bd.scrollTop=ta.scrollTop; bd.scrollLeft=ta.scrollLeft; });
   ta.addEventListener('blur', sendValue);
   function updateCounts(){ var c=document.getElementById('chips');
-    var nodes=c.querySelectorAll('.chip'); nodes.forEach(function(n){
-      var tok=n.getAttribute('data-tok'); var cn=n.querySelector('.cnt');
-      if(cn) cn.textContent='×'+countOf(tok); }); }
-  function renderChips(vars){ lastVars=vars||[]; var c=document.getElementById('chips'); c.innerHTML='';
-    lastVars.forEach(function(v){ var tok=v[0], lbl=v[1]||'';
+    c.querySelectorAll('.chip').forEach(function(n){ var cn=n.querySelector('.cnt');
+      if(cn) cn.textContent='×'+countOf(n.getAttribute('data-tok')); }); }
+  function renderChips(vars){ var c=document.getElementById('chips'); c.innerHTML='';
+    (vars||[]).forEach(function(v){ var tok=v[0], lbl=v[1]||'';
       var el=document.createElement('div'); el.className='chip'; el.setAttribute('data-tok',tok);
       el.innerHTML='<div class="chiprow"><code>{'+tok+'}</code>'
         +'<span class="cnt">×'+countOf(tok)+'</span>'
@@ -101,20 +119,20 @@ _HTML = r"""<!doctype html><html><head><meta charset="utf-8">
       el.querySelector('.del').onclick=(function(tk){return function(ev){ ev.stopPropagation();
         if(confirm('Удалить переменную {'+tk+'} из этого документа и из текста?')) deleteVar(tk); };})(tok);
       c.appendChild(el); }); setHeight(); }
-  function applyTheme(th){ if(th&&th.textColor){ ta.style.color=th.textColor; } }
+  function applyTheme(th){ if(th&&th.textColor){ bd.style.color=th.textColor; ta.style.caretColor=th.textColor; } }
   window.addEventListener('message', function(ev){ var d=ev.data;
     if(!d || d.type!=='streamlit:render') return; var a=d.args||{};
     if(!inited){ ta.value=a.text||''; inited=true; }
-    renderChips(a.variables); applyTheme(d.theme); setHeight(); });
+    updateBackdrop(); renderChips(a.variables); applyTheme(d.theme); setHeight(); });
   post('streamlit:componentReady',{apiVersion:1});
-  setHeight();
+  updateBackdrop(); setHeight();
 </script></body></html>"""
 
 _DIR = tempfile.mkdtemp(prefix="go_editor_")
 with open(os.path.join(_DIR, "index.html"), "w", encoding="utf-8") as _f:
     _f.write(_HTML)
 
-_component = components.declare_component("go_template_editor_v4", path=_DIR)
+_component = components.declare_component("go_template_editor_v5", path=_DIR)
 
 
 def template_editor(text: str, variables, key=None):
