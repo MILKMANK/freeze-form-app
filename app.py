@@ -43,7 +43,7 @@ BUILTIN_ORDER = ["freeze", "extension"]
 
 # ---------------- хранилище ----------------
 def load_data():
-    d = {"texts": {}, "custom_types": [], "saved": {}, "variables": []}
+    d = {"texts": {}, "custom_types": [], "saved": {}, "variables": [], "extra_tokens": {}}
     if DATA_FILE.exists():
         try:
             d.update(json.loads(DATA_FILE.read_text(encoding="utf-8")))
@@ -105,6 +105,33 @@ def fields_of(t):
             for tok in t["var_tokens"]]
 
 
+def base_tokens(t):
+    return list(BUILTINS[t["key"]]["var_tokens"]) if t["builtin"] else list(t["var_tokens"])
+
+
+def extra_tokens(t):
+    return D().setdefault("extra_tokens", {}).get(t["key"], [])
+
+
+def all_tokens(t):
+    seen = []
+    for tok in base_tokens(t) + extra_tokens(t):
+        if tok not in seen:
+            seen.append(tok)
+    return seen
+
+
+def add_token_to_type(t, tok):
+    if t["builtin"]:
+        lst = D().setdefault("extra_tokens", {}).setdefault(t["key"], [])
+        if tok not in lst and tok not in base_tokens(t):
+            lst.append(tok)
+    else:
+        ct = next(c for c in D()["custom_types"] if c["key"] == t["key"])
+        if tok not in ct["var_tokens"]:
+            ct["var_tokens"].append(tok)
+
+
 def text_of(tk):
     if tk in D()["texts"]:
         return D()["texts"][tk]
@@ -112,7 +139,7 @@ def text_of(tk):
 
 
 def vars_panel(t):
-    return [[tok, var_get(tok)["label"]] for tok in t["var_tokens"]]
+    return [[tok, var_get(tok)["label"]] for tok in all_tokens(t)]
 
 
 # ---------------- форма / контекст ----------------
@@ -132,6 +159,24 @@ def linked_expiration(ns, start_key, label):
     if not st.session_state[tch]:
         st.session_state[exp_key] = E.add_months(st.session_state[start_key], 6)
     return st.date_input(label, key=exp_key, on_change=_mark, args=(tch,))
+
+
+def _render_extra(t, ns):
+    extra = {}
+    toks = extra_tokens(t)
+    if toks:
+        st.markdown("**Дополнительные поля**")
+    for tok in toks:
+        v = var_get(tok)
+        key = ns + "x_" + tok
+        if v["type"] == "date":
+            _ensure(key, date.today())
+            extra[tok] = st.date_input(v["label"], key=key)
+        elif v["type"] == "number":
+            extra[tok] = st.number_input(v["label"], value=0, key=key)
+        else:
+            extra[tok] = st.text_input(v["label"], key=key)
+    return extra
 
 
 def render_form(t):
@@ -161,7 +206,7 @@ def render_form(t):
                 bend = st.date_input("Дата окончания паузы", key=ns + "bend")
             st.text_area("Причина паузы (опционально)", key=ns + "reason",
                          placeholder="Если пусто — N/A")
-            return {"exhibit": st.session_state[ns + "exhibit"],
+            form = {"exhibit": st.session_state[ns + "exhibit"],
                     "client_name": st.session_state[ns + "client_name"].strip(),
                     "selected_plan": st.session_state[ns + "selected_plan"].strip(),
                     "start_date": st.session_state[ns + "start"], "orig_exp": orig_exp,
@@ -169,15 +214,17 @@ def render_form(t):
                     "mode": "days" if mode == "По количеству дней" else "enddate",
                     "break_days": st.session_state.get(ns + "bdays", 14), "break_end": bend,
                     "reason": st.session_state.get(ns + "reason", "")}
+            return form, _render_extra(t, ns)
         else:
             cur = linked_expiration(ns, ns + "start", "Текущая дата окончания (по умолч. +6 мес.)")
             st.subheader("Параметры продления")
             st.number_input("Продлить на (месяцев)", 1, 120, 6, 1, key=ns + "months")
-            return {"exhibit": st.session_state[ns + "exhibit"],
+            form = {"exhibit": st.session_state[ns + "exhibit"],
                     "client_name": st.session_state[ns + "client_name"].strip(),
                     "selected_plan": st.session_state[ns + "selected_plan"].strip(),
                     "start_date": st.session_state[ns + "start"], "current_exp": cur,
                     "ext_months": st.session_state[ns + "months"]}
+            return form, _render_extra(t, ns)
     else:
         form = {}
         flds = fields_of(t)
@@ -192,7 +239,18 @@ def render_form(t):
                 form[f["key"]] = st.number_input(f["label"], value=0, key=key)
             else:
                 form[f["key"]] = st.text_input(f["label"], key=key)
-        return form
+        return form, {}
+
+
+def compute_full(t, form, extra):
+    r = compute(t, form)
+    if r["err"]:
+        return r
+    ctx = dict(r["ctx"])
+    for tok, val in (extra or {}).items():
+        vt = var_get(tok)["type"]
+        ctx[tok] = E.fmt(val) if vt == "date" else ("" if val is None else str(val))
+    return {"err": None, "ctx": ctx}
 
 
 def compute(t, form):
@@ -295,7 +353,7 @@ if sec == "create":
     st.title(f"{t['name']} — создать")
     if st.session_state.step == 1:
         st.caption("Шаг 1 из 2 — данные")
-        form = render_form(t)
+        form, extra = render_form(t)
         if st.button("Далее — предпросмотр →", type="primary"):
             ok = True
             if t["kind"] in ("freeze", "extension"):
@@ -303,7 +361,7 @@ if sec == "create":
             if not ok:
                 st.error("Заполни имя клиента и план.")
             else:
-                r = compute(t, form)
+                r = compute_full(t, form, extra)
                 if r["err"]:
                     st.error(r["err"])
                 else:
@@ -356,43 +414,44 @@ elif sec == "template":
     if not t["builtin"]:
         ct = next(c for c in D()["custom_types"] if c["key"] == t["key"])
         ct["name"] = st.text_input("Название типа документа", ct["name"])
-        st.markdown("**Поля формы** (переменные документа)")
-        rm = None
-        for i, tok in enumerate(ct["var_tokens"]):
-            c = st.columns([5, 1])
-            v = var_get(tok)
-            c[0].markdown(f"`{{{tok}}}` — {v['label']} · _{v['type']}_")
-            if c[1].button("🗑", key=f"rmv_{t['key']}_{i}"):
-                rm = i
-        if rm is not None:
-            ct["var_tokens"].pop(rm); save_data(); st.rerun()
-        with st.expander("➕ Добавить поле"):
-            avail = [v for v in variables() if v["token"] not in ct["var_tokens"]]
-            opts = ["➕ Создать новую переменную"] + [f"{v['label']}  ·  {{{v['token']}}}" for v in avail]
-            choice = st.selectbox("Переменная", opts, key=f"addsel_{t['key']}")
-            if choice == "➕ Создать новую переменную":
-                nl = st.text_input("Название (метка)", key=f"nl_{t['key']}")
-                ntok = st.text_input("Токен (латиницей, без пробелов)", key=f"nt_{t['key']}")
-                ntype = st.selectbox("Тип", ["text", "date", "number"], key=f"nty_{t['key']}")
-                if st.button("Создать и добавить", key=f"addnew_{t['key']}"):
-                    tok = "".join(ch for ch in ntok if ch.isalnum() or ch == "_")
-                    if not tok:
-                        st.error("Укажи токен.")
-                    elif any(v["token"] == tok for v in variables()):
-                        st.error("Такой токен уже есть — выбери его из списка.")
-                    else:
-                        variables().append({"token": tok, "label": nl or tok, "type": ntype})
-                        ct["var_tokens"].append(tok); save_data(); st.rerun()
-            else:
-                if st.button("Добавить", key=f"addex_{t['key']}"):
-                    tok = avail[opts.index(choice) - 1]["token"]
-                    ct["var_tokens"].append(tok); save_data(); st.rerun()
 
     st.markdown("**Текст документа** — таблица подписей добавляется автоматически в конце.")
     new_text = template_editor(text=text_of(t["key"]), variables=vars_panel(t),
                                key=f"editor_{t['key']}_{st.session_state.editor_nonce}")
     if new_text is not None:
         D()["texts"][t["key"]] = new_text
+
+    with st.expander("➕ Добавить / создать переменную"):
+        cur_toks = all_tokens(t)
+        avail = [v for v in variables() if v["token"] not in cur_toks]
+        opts = ["➕ Создать новую переменную"] + [f"{v['label']}  ·  {{{v['token']}}}" for v in avail]
+        choice = st.selectbox("Переменная", opts, key=f"addsel_{t['key']}")
+        if choice == "➕ Создать новую переменную":
+            nl = st.text_input("Название (метка)", key=f"nl_{t['key']}")
+            ntok = st.text_input("Токен (латиницей, без пробелов)", key=f"nt_{t['key']}")
+            ntype = st.selectbox("Тип", ["text", "date", "number"], key=f"nty_{t['key']}")
+            if st.button("Создать и добавить", key=f"addnew_{t['key']}"):
+                tok = "".join(ch for ch in ntok if ch.isalnum() or ch == "_")
+                if not tok:
+                    st.error("Укажи токен.")
+                elif any(v["token"] == tok for v in variables()):
+                    st.error("Такой токен уже есть — выбери его из списка.")
+                else:
+                    variables().append({"token": tok, "label": nl or tok, "type": ntype})
+                    add_token_to_type(t, tok); save_data(); st.rerun()
+        else:
+            if st.button("Добавить", key=f"addex_{t['key']}"):
+                tok = avail[opts.index(choice) - 1]["token"]
+                add_token_to_type(t, tok); save_data(); st.rerun()
+
+        removable = extra_tokens(t) if t["builtin"] else t["var_tokens"]
+        if removable:
+            st.caption("Удалить добавленную переменную:")
+            for i, tok in enumerate(list(removable)):
+                cc = st.columns([5, 1])
+                cc[0].markdown(f"`{{{tok}}}` — {var_get(tok)['label']}")
+                if cc[1].button("🗑", key=f"rmv_{t['key']}_{i}"):
+                    removable.remove(tok); save_data(); st.rerun()
 
     a1, a2 = st.columns(2)
     with a1:
