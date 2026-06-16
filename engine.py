@@ -38,6 +38,51 @@ def fmt(d) -> str:
     return d.strftime(DATE_FMT) if d else "—"
 
 
+def add_duration(d: date, n: int, unit: str) -> date:
+    """unit: 'months' или 'days'."""
+    return add_months(d, n) if unit == "months" else d + timedelta(days=n)
+
+
+# типы-длительности и их единица
+DURATION_UNIT = {"dur_days": "days", "dur_months": "months"}
+
+
+def compute_fields(defs: list, form: dict) -> dict:
+    """
+    Универсальный расчёт по списку переменных.
+    defs: [{token,label,type, base?, dur?}], type in
+          text|number|date|dur_days|dur_months|calc_date.
+    calc_date: дата = (base: дата) + (dur: длительность с её единицей).
+    """
+    tmap = {v["token"]: v["type"] for v in defs}
+    raw, ctx = {}, {}
+    for v in defs:
+        tok, tp = v["token"], v["type"]
+        if tp == "date":
+            val = form.get(tok); raw[tok] = val
+            ctx[tok] = fmt(val) if val else "—"
+        elif tp in ("text", "number", "dur_days", "dur_months"):
+            val = form.get(tok); raw[tok] = val
+            ctx[tok] = "" if val in (None, "") else str(val)
+    for v in defs:
+        if v["type"] == "calc_date":
+            base = raw.get(v.get("base"))
+            durtok = v.get("dur")
+            dur = raw.get(durtok)
+            unit = DURATION_UNIT.get(tmap.get(durtok), "days")
+            if base and dur not in (None, ""):
+                d = add_duration(base, int(dur), unit)
+                raw[v["token"]] = d; ctx[v["token"]] = fmt(d)
+            else:
+                ctx[v["token"]] = "—"
+    return {"err": None, "ctx": ctx, "raw": raw}
+
+
+# обратная совместимость
+def compute_custom(fields: list, form: dict) -> dict:
+    return compute_fields(fields, form)
+
+
 # ------------- контекст по типам -------------
 def compute_freeze(f: dict) -> dict:
     bs, st = f["break_start"], f["start_date"]
@@ -62,6 +107,9 @@ def compute_freeze(f: dict) -> dict:
         "break_days": str(bd or "—"),
         "reason": (f.get("reason") or "").strip() or "N/A",
         "adjusted_expiration": fmt(adj),
+    }, "raw": {
+        "start_date": st, "orig_expiration": oe, "break_start": bs, "break_end": bend,
+        "break_days": bd, "adjusted_expiration": adj,
     }}
 
 
@@ -77,18 +125,10 @@ def compute_extension(f: dict) -> dict:
         "current_expiration": fmt(cur),
         "extension_months": str(m),
         "new_expiration": fmt(ne),
+    }, "raw": {
+        "start_date": f["start_date"], "current_expiration": cur,
+        "extension_months": m, "new_expiration": ne,
     }}
-
-
-def compute_custom(fields: list, f: dict) -> dict:
-    ctx = {}
-    for fd in fields:
-        v = f.get(fd["key"])
-        if fd["type"] == "date":
-            ctx[fd["key"]] = fmt(v) if v else "—"
-        else:
-            ctx[fd["key"]] = "" if v is None else str(v)
-    return {"err": None, "ctx": ctx}
 
 
 # ------------- дефолтные шаблоны -------------

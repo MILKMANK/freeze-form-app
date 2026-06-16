@@ -101,8 +101,12 @@ def get_type(tk):
 
 
 def fields_of(t):
-    return [{"key": tok, "label": var_get(tok)["label"], "type": var_get(tok)["type"]}
-            for tok in t["var_tokens"]]
+    out = []
+    for tok in t["var_tokens"]:
+        v = var_get(tok)
+        out.append({"key": tok, "token": tok, "label": v["label"], "type": v["type"],
+                    "base": v.get("base"), "dur": v.get("dur")})
+    return out
 
 
 def base_tokens(t):
@@ -163,17 +167,22 @@ def linked_expiration(ns, start_key, label):
 
 def _render_extra(t, ns):
     extra = {}
-    toks = extra_tokens(t)
-    if toks:
+    toks = [tk for tk in extra_tokens(t)]
+    shown = [tk for tk in toks if var_get(tk)["type"] != "calc_date"]
+    if shown:
         st.markdown("**Дополнительные поля**")
     for tok in toks:
         v = var_get(tok)
+        tp = v["type"]
+        if tp == "calc_date":
+            continue  # вычисляется автоматически
         key = ns + "x_" + tok
-        if v["type"] == "date":
+        if tp == "date":
             _ensure(key, date.today())
             extra[tok] = st.date_input(v["label"], key=key)
-        elif v["type"] == "number":
-            extra[tok] = st.number_input(v["label"], value=0, key=key)
+        elif tp in ("number", "dur_days", "dur_months"):
+            lbl = v["label"] + (" (дней)" if tp == "dur_days" else " (мес.)" if tp == "dur_months" else "")
+            extra[tok] = st.number_input(lbl, value=0, step=1, key=key)
         else:
             extra[tok] = st.text_input(v["label"], key=key)
     return extra
@@ -228,15 +237,20 @@ def render_form(t):
     else:
         form = {}
         flds = fields_of(t)
-        if not flds:
-            st.info("У этого типа пока нет полей. Добавь их в разделе «шаблон».")
+        inputs = [f for f in flds if f["type"] != "calc_date"]
+        if not inputs:
+            st.info("У этого типа пока нет полей для ввода. Добавь их в разделе «шаблон».")
         for f in flds:
+            tp = f["type"]
+            if tp == "calc_date":
+                continue
             key = ns + f["key"]
-            if f["type"] == "date":
+            if tp == "date":
                 _ensure(key, date.today())
                 form[f["key"]] = st.date_input(f["label"], key=key)
-            elif f["type"] == "number":
-                form[f["key"]] = st.number_input(f["label"], value=0, key=key)
+            elif tp in ("number", "dur_days", "dur_months"):
+                lbl = f["label"] + (" (дней)" if tp == "dur_days" else " (мес.)" if tp == "dur_months" else "")
+                form[f["key"]] = st.number_input(lbl, value=0, step=1, key=key)
             else:
                 form[f["key"]] = st.text_input(f["label"], key=key)
         return form, {}
@@ -246,10 +260,24 @@ def compute_full(t, form, extra):
     r = compute(t, form)
     if r["err"]:
         return r
-    ctx = dict(r["ctx"])
+    ctx = dict(r["ctx"]); raw = dict(r.get("raw", {}))
     for tok, val in (extra or {}).items():
+        raw[tok] = val
         vt = var_get(tok)["type"]
-        ctx[tok] = E.fmt(val) if vt == "date" else ("" if val is None else str(val))
+        if vt == "date":
+            ctx[tok] = E.fmt(val) if val else "—"
+        else:
+            ctx[tok] = "" if val in (None, "") else str(val)
+    for tok in extra_tokens(t):
+        v = var_get(tok)
+        if v["type"] == "calc_date":
+            base = raw.get(v.get("base")); durtok = v.get("dur"); dur = raw.get(durtok)
+            unit = E.DURATION_UNIT.get(var_get(durtok)["type"], "days") if durtok else "days"
+            if base and dur not in (None, ""):
+                d = E.add_duration(base, int(dur), unit)
+                raw[tok] = d; ctx[tok] = E.fmt(d)
+            else:
+                ctx[tok] = "—"
     return {"err": None, "ctx": ctx}
 
 
@@ -258,7 +286,7 @@ def compute(t, form):
         return E.compute_freeze(form)
     if t["kind"] == "extension":
         return E.compute_extension(form)
-    return E.compute_custom(fields_of(t), form)
+    return E.compute_fields(fields_of(t), form)
 
 
 def metrics_of(t, ctx):
@@ -427,17 +455,40 @@ elif sec == "template":
         opts = ["➕ Создать новую переменную"] + [f"{v['label']}  ·  {{{v['token']}}}" for v in avail]
         choice = st.selectbox("Переменная", opts, key=f"addsel_{t['key']}")
         if choice == "➕ Создать новую переменную":
+            type_labels = [("text", "текст"), ("date", "дата"), ("number", "число"),
+                           ("dur_days", "длительность (дни)"), ("dur_months", "длительность (месяцы)"),
+                           ("calc_date", "вычисляемая дата (дата + длительность)")]
             nl = st.text_input("Название (метка)", key=f"nl_{t['key']}")
             ntok = st.text_input("Токен (латиницей, без пробелов)", key=f"nt_{t['key']}")
-            ntype = st.selectbox("Тип", ["text", "date", "number"], key=f"nty_{t['key']}")
+            ntype_label = st.selectbox("Тип", [l for _, l in type_labels], key=f"nty_{t['key']}")
+            ntype = dict((l, v) for v, l in type_labels)[ntype_label]
+            base = dur = None
+            if ntype == "calc_date":
+                date_toks = [tok for tok in cur_toks if var_get(tok)["type"] == "date"]
+                dur_toks = [tok for tok in cur_toks if var_get(tok)["type"] in ("dur_days", "dur_months")]
+                if not date_toks or not dur_toks:
+                    st.info("Сначала добавь в этот документ переменную-дату и переменную-длительность, "
+                            "потом создавай вычисляемую дату.")
+                else:
+                    base = st.selectbox("База (дата)",
+                        date_toks, format_func=lambda x: f"{var_get(x)['label']}  ·  {{{x}}}",
+                        key=f"cb_{t['key']}")
+                    dur = st.selectbox("Длительность",
+                        dur_toks, format_func=lambda x: f"{var_get(x)['label']}  ·  {{{x}}}",
+                        key=f"cd_{t['key']}")
             if st.button("Создать и добавить", key=f"addnew_{t['key']}"):
                 tok = "".join(ch for ch in ntok if ch.isalnum() or ch == "_")
                 if not tok:
                     st.error("Укажи токен.")
                 elif any(v["token"] == tok for v in variables()):
                     st.error("Такой токен уже есть — выбери его из списка.")
+                elif ntype == "calc_date" and not (base and dur):
+                    st.error("Для вычисляемой даты нужны переменная-дата и переменная-длительность.")
                 else:
-                    variables().append({"token": tok, "label": nl or tok, "type": ntype})
+                    nv = {"token": tok, "label": nl or tok, "type": ntype}
+                    if ntype == "calc_date":
+                        nv["base"] = base; nv["dur"] = dur
+                    variables().append(nv)
                     add_token_to_type(t, tok); save_data(); st.rerun()
         else:
             if st.button("Добавить", key=f"addex_{t['key']}"):
@@ -449,7 +500,11 @@ elif sec == "template":
             st.caption("Удалить добавленную переменную:")
             for i, tok in enumerate(list(removable)):
                 cc = st.columns([5, 1])
-                cc[0].markdown(f"`{{{tok}}}` — {var_get(tok)['label']}")
+                v = var_get(tok)
+                extra_lbl = ""
+                if v["type"] == "calc_date":
+                    extra_lbl = f"  (= {{{v.get('base')}}} + {{{v.get('dur')}}})"
+                cc[0].markdown(f"`{{{tok}}}` — {v['label']}{extra_lbl}")
                 if cc[1].button("🗑", key=f"rmv_{t['key']}_{i}"):
                     removable.remove(tok); save_data(); st.rerun()
 
