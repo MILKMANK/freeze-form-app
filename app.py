@@ -46,7 +46,7 @@ BUILTIN_ORDER = ["freeze", "extension"]
 # ---------------- хранилище ----------------
 def load_data():
     d = {"texts": {}, "custom_types": [], "saved": {}, "variables": [], "extra_tokens": {},
-         "type_created": {}, "archived": {}, "required": {}, "deleted_defaults": []}
+         "type_created": {}, "archived": {}, "required": {}, "deleted_defaults": [], "sig_table": {}}
     loaded, src = storage.load(DATA_FILE)
     st.session_state["storage_src"] = src
     if loaded:
@@ -147,9 +147,17 @@ def restore_type(key):
 
 
 @st.cache_data(show_spinner=False)
-def cached_pdf(text, ctx_json, client):
+def cached_pdf(text, ctx_json, client, with_sig=True):
     ctx = json.loads(ctx_json)
-    return E.docx_to_pdf_bytes(E.build_docx(text, ctx, client))
+    return E.docx_to_pdf_bytes(E.build_docx(text, ctx, client, with_signature=with_sig))
+
+
+def sig_enabled(t):
+    return D().setdefault("sig_table", {}).get(t["key"], True)
+
+
+def set_sig(t, val):
+    D().setdefault("sig_table", {})[t["key"]] = bool(val)
 
 
 def get_type(tk):
@@ -897,10 +905,11 @@ if sec == "create":
             cols = st.columns(len(mt))
             for col, (lbl, val) in zip(cols, mt):
                 col.metric(lbl, val)
-        st.markdown(preview_html(text_of(t["key"]), ctx, client, True, highlight_vars=True),
+        sig = sig_enabled(t)
+        st.markdown(preview_html(text_of(t["key"]), ctx, client, sig, highlight_vars=True),
                     unsafe_allow_html=True)
         st.write("")
-        docx_bytes = E.build_docx(text_of(t["key"]), ctx, client)
+        docx_bytes = E.build_docx(text_of(t["key"]), ctx, client, with_signature=sig)
         fname = f"{E.safe_name(client)}_{t['key']}"
         b1, b2, b3, b4 = st.columns(4)
         with b1:
@@ -913,7 +922,7 @@ if sec == "create":
         with b3:
             if E._find_soffice():
                 try:
-                    pdf_bytes = cached_pdf(text_of(t["key"]), json.dumps(ctx, ensure_ascii=False), client)
+                    pdf_bytes = cached_pdf(text_of(t["key"]), json.dumps(ctx, ensure_ascii=False), client, sig)
                     st.download_button("⬇️ PDF", pdf_bytes, file_name=fname + ".pdf",
                         mime="application/pdf", use_container_width=True)
                 except Exception:
@@ -926,6 +935,7 @@ if sec == "create":
                     "client": client or "—", "date": date.today().strftime(E.DATE_FMT),
                     "created_iso": date.today().isoformat(),
                     "type_name": t["name"], "text": text_of(t["key"]), "ctx": ctx,
+                    "sig": sig,
                     "form": st.session_state.get("cur_form", {}),
                     "extra": st.session_state.get("cur_extra", {})})
                 save_data(); st.success("Сохранено в «созданные документы».")
@@ -937,7 +947,13 @@ elif sec == "template":
         ct = next(c for c in D()["custom_types"] if c["key"] == t["key"])
         ct["name"] = st.text_input("Название типа документа", ct["name"])
 
-    st.markdown("**Текст документа** — таблица подписей добавляется автоматически в конце.")
+    cur_sig = sig_enabled(t)
+    new_sig = st.checkbox("Добавлять таблицу подписей в конце документа", value=cur_sig,
+                          key=f"sig_{t['key']}")
+    if new_sig != cur_sig:
+        set_sig(t, new_sig); save_data(); st.rerun()
+    st.markdown("**Текст документа**" + (" — таблица подписей добавляется автоматически в конце."
+                if new_sig else " — таблица подписей отключена."))
     ret = template_editor(text=text_of(t["key"]), variables=editor_vars(t),
                           key=f"editor_{t['key']}_{st.session_state.editor_nonce}")
     if isinstance(ret, dict):
@@ -1148,7 +1164,7 @@ elif sec == "template":
 
     st.markdown("**Предпросмотр**")
     ph = {tok: lbl for tok, lbl in vars_panel(t)}
-    st.markdown(preview_html(text_of(t["key"]), ph, "Имя клиента", False, highlight_vars=True),
+    st.markdown(preview_html(text_of(t["key"]), ph, "Имя клиента", sig_enabled(t), highlight_vars=True),
                 unsafe_allow_html=True)
 
 # ===== СОЗДАННЫЕ =====
@@ -1170,14 +1186,15 @@ elif sec == "created":
                 c[0].markdown(f"**{e['client']}**  \n<span style='color:gray;font-size:12px'>"
                               f"создан: {e['date']} · {e['type_name']}</span>", unsafe_allow_html=True)
                 client = e["ctx"].get("name", e.get("client", ""))
-                docx_bytes = E.build_docx(e["text"], e["ctx"], client)
+                esig = e.get("sig", sig_enabled(t))
+                docx_bytes = E.build_docx(e["text"], e["ctx"], client, with_signature=esig)
                 fname = f"{E.safe_name(e['client'])}_{t['key']}"
                 c[1].download_button("⬇️ .docx", docx_bytes, file_name=fname + ".docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                     key=f"dl_{t['key']}_{i}", use_container_width=True)
                 if E._find_soffice():
                     try:
-                        pdf_bytes = cached_pdf(e["text"], json.dumps(e["ctx"], ensure_ascii=False), client)
+                        pdf_bytes = cached_pdf(e["text"], json.dumps(e["ctx"], ensure_ascii=False), client, esig)
                         c[2].download_button("⬇️ PDF", pdf_bytes, file_name=fname + ".pdf",
                             mime="application/pdf", key=f"dlp_{t['key']}_{i}", use_container_width=True)
                     except Exception:

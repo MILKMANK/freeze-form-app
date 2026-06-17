@@ -567,7 +567,7 @@ def _signature_table(doc, client_name: str):
     return table
 
 
-def build_docx(text: str, ctx: dict, client_name: str) -> bytes:
+def build_docx(text: str, ctx: dict, client_name: str, with_signature: bool = True) -> bytes:
     doc = Document()
     style = doc.styles["Normal"]
     style.font.name = "Arial"
@@ -593,8 +593,9 @@ def build_docx(text: str, ctx: dict, client_name: str) -> bytes:
             p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.LEFT
             _add_runs(p, line, ctx)
 
-    doc.add_paragraph()
-    _signature_table(doc, client_name)
+    if with_signature:
+        doc.add_paragraph()
+        _signature_table(doc, client_name)
 
     buf = io.BytesIO(); doc.save(buf)
     return buf.getvalue()
