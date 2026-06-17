@@ -8,6 +8,7 @@ from pathlib import Path
 
 import streamlit as st
 import engine as E
+import storage
 from editor import template_editor
 
 DATA_FILE = Path(__file__).parent / "data.json"
@@ -44,12 +45,12 @@ BUILTIN_ORDER = ["freeze", "extension"]
 
 # ---------------- хранилище ----------------
 def load_data():
-    d = {"texts": {}, "custom_types": [], "saved": {}, "variables": [], "extra_tokens": {}}
-    if DATA_FILE.exists():
-        try:
-            d.update(json.loads(DATA_FILE.read_text(encoding="utf-8")))
-        except Exception:
-            pass
+    d = {"texts": {}, "custom_types": [], "saved": {}, "variables": [], "extra_tokens": {},
+         "type_created": {}, "archived": {}}
+    loaded, src = storage.load(DATA_FILE)
+    st.session_state["storage_src"] = src
+    if loaded:
+        d.update(loaded)
     have = {v["token"] for v in d.get("variables", [])}
     for v in DEFAULT_VARS:
         if v["token"] not in have:
@@ -69,16 +70,20 @@ def load_data():
             ct["var_tokens"] = toks
         ct.pop("fields", None)
     d.setdefault("extra_tokens", {})
+    d.setdefault("archived", {})
+    tc = d.setdefault("type_created", {})
+    today_iso = date.today().isoformat()
+    for k in BUILTIN_ORDER:
+        tc.setdefault(k, today_iso)
+    for ct in d.get("custom_types", []):
+        tc.setdefault(ct["key"], today_iso)
     return d
 
 
 def save_data():
-    try:
-        DATA_FILE.write_text(json.dumps(st.session_state.data, ensure_ascii=False, indent=2),
-                             encoding="utf-8")
-        return True
-    except Exception:
-        return False
+    src = storage.save(st.session_state.data, DATA_FILE)
+    st.session_state["storage_src"] = src
+    return src != "error"
 
 
 def D():
@@ -98,15 +103,51 @@ def var_get(token):
 
 # ---------------- типы ----------------
 def all_types():
+    arch = D().get("archived", {})
     out = []
     for k in BUILTIN_ORDER:
+        if k in arch:
+            continue
         b = BUILTINS[k]
         out.append({"key": k, "name": b["name"], "builtin": True, "kind": b["kind"],
                     "var_tokens": b["var_tokens"]})
     for ct in D()["custom_types"]:
+        if ct["key"] in arch:
+            continue
         out.append({"key": ct["key"], "name": ct["name"], "builtin": False, "kind": "custom",
                     "var_tokens": ct.get("var_tokens", [])})
     return out
+
+
+def type_name(key):
+    if key in BUILTINS:
+        return BUILTINS[key]["name"]
+    for ct in D()["custom_types"]:
+        if ct["key"] == key:
+            return ct["name"]
+    return key
+
+
+def fmt_iso(s):
+    try:
+        y, m, dd = s.split("-")
+        return f"{dd}.{m}.{y}"
+    except Exception:
+        return s or "—"
+
+
+def archive_type(key):
+    D().setdefault("archived", {})[key] = date.today().isoformat()
+
+
+def restore_type(key):
+    D().setdefault("archived", {}).pop(key, None)
+
+
+@st.cache_data(show_spinner=False)
+def cached_pdf(text, ctx_json, client):
+    ctx = json.loads(ctx_json)
+    return E.docx_to_pdf_bytes(E.build_docx(text, ctx, client))
 
 
 def get_type(tk):
@@ -406,6 +447,35 @@ def preview_html(text, ctx, client, with_table=True, highlight_vars=False):
 
 # ---------------- состояние ----------------
 st.set_page_config(page_title="Go Offer Docs", page_icon="📄", layout="wide")
+
+
+def _password_set():
+    try:
+        return bool(st.secrets.get("app_password"))
+    except Exception:
+        return False
+
+
+def check_password():
+    if not _password_set():
+        return True  # пароль не задан (локальная разработка) — открыто
+    if st.session_state.get("auth_ok"):
+        return True
+    st.title("Go Offer Docs")
+    st.caption("Вход для сотрудников")
+    pw = st.text_input("Пароль", type="password", key="pw_input")
+    if st.button("Войти", type="primary"):
+        if pw == st.secrets["app_password"]:
+            st.session_state.auth_ok = True
+            st.rerun()
+        else:
+            st.error("Неверный пароль.")
+    return False
+
+
+if not check_password():
+    st.stop()
+
 if "data" not in st.session_state:
     st.session_state.data = load_data()
 for k, v in [("type", "freeze"), ("section", "create"), ("step", 1), ("editor_nonce", 0),
@@ -421,17 +491,93 @@ def goto(tk, section):
     st.session_state.section = section
 
 
+def _ser(v):
+    return v.isoformat() if isinstance(v, date) else v
+
+
+def serialize_form(form, extra):
+    return ({k: _ser(v) for k, v in (form or {}).items()},
+            {k: _ser(v) for k, v in (extra or {}).items()})
+
+
+def _parse(v):
+    try:
+        if isinstance(v, str) and len(v) == 10 and v[4] == "-" and v[7] == "-":
+            return date.fromisoformat(v)
+    except Exception:
+        pass
+    return v
+
+
+def repopulate(t, form, extra):
+    """Загружает сохранённые данные документа обратно в форму создания."""
+    ns = t["key"] + "_"
+    f = form or {}
+    ex = extra or {}
+    if t["kind"] == "freeze":
+        st.session_state[ns + "exhibit"] = f.get("exhibit", "A")
+        st.session_state[ns + "client_name"] = f.get("client_name", "")
+        st.session_state[ns + "selected_plan"] = f.get("selected_plan", "")
+        st.session_state[ns + "start"] = _parse(f.get("start_date")) or date.today()
+        st.session_state[ns + "exp"] = _parse(f.get("orig_exp")) or date.today()
+        st.session_state[ns + "exp_touched"] = True
+        st.session_state[ns + "bstart"] = _parse(f.get("break_start")) or date.today()
+        st.session_state[ns + "mode"] = "По количеству дней" if f.get("mode") == "days" else "По дате окончания"
+        st.session_state[ns + "bdays"] = int(f.get("break_days") or 14)
+        if f.get("break_end"):
+            st.session_state[ns + "bend"] = _parse(f.get("break_end"))
+        st.session_state[ns + "reason"] = f.get("reason", "")
+    elif t["kind"] == "extension":
+        st.session_state[ns + "exhibit"] = f.get("exhibit", "A")
+        st.session_state[ns + "client_name"] = f.get("client_name", "")
+        st.session_state[ns + "selected_plan"] = f.get("selected_plan", "")
+        st.session_state[ns + "start"] = _parse(f.get("start_date")) or date.today()
+        st.session_state[ns + "exp"] = _parse(f.get("current_exp")) or date.today()
+        st.session_state[ns + "exp_touched"] = True
+        st.session_state[ns + "months"] = int(f.get("ext_months") or 6)
+    else:
+        for tok, val in f.items():
+            st.session_state[ns + tok] = _parse(val)
+    for tok, val in ex.items():
+        st.session_state[ns + "x_" + tok] = _parse(val)
+
+
+def duplicate_type(src):
+    n = len(D()["custom_types"]) + 1
+    key = f"custom{n}"
+    while any(c["key"] == key for c in D()["custom_types"]) or key in BUILTINS:
+        n += 1; key = f"custom{n}"
+    D()["custom_types"].append({"key": key, "name": type_name(src["key"]) + " (копия)",
+                                "var_tokens": list(all_tokens(src))})
+    D()["texts"][key] = text_of(src["key"])
+    D().setdefault("type_created", {})[key] = date.today().isoformat()
+    return key
+
+
 # ---------------- меню (тоглы) ----------------
 with st.sidebar:
     st.markdown("### Документы")
+    q = st.text_input("🔎 Поиск типа", key="type_search", placeholder="название типа…").strip().lower()
     subs = [("create", "создать документ"), ("template", "шаблон"), ("created", "созданные документы")]
-    for t in all_types():
+    shown = [t for t in all_types() if not q or q in t["name"].lower()]
+    if not shown and q:
+        st.caption("Ничего не найдено.")
+    for t in shown:
         with st.expander(t["name"].upper(), expanded=(st.session_state.type == t["key"])):
             for sk, sl in subs:
                 active = st.session_state.type == t["key"] and st.session_state.section == sk
                 if st.button(("• " if active else "") + sl, key=f"nav_{t['key']}_{sk}",
                              use_container_width=True):
                     goto(t["key"], sk); st.rerun()
+            d1, d2 = st.columns(2)
+            if d1.button("📑 Дублировать", key=f"dup_{t['key']}", use_container_width=True):
+                nk = duplicate_type(t); save_data(); goto(nk, "template"); st.rerun()
+            if d2.button("🗑 В архив", key=f"arch_{t['key']}", use_container_width=True):
+                archive_type(t["key"])
+                rem = [x["key"] for x in all_types()]
+                if st.session_state.type == t["key"]:
+                    st.session_state.type = rem[0] if rem else None
+                save_data(); st.rerun()
     st.divider()
     if st.button("➕ Создать новый тип", use_container_width=True):
         n = len(D()["custom_types"]) + 1
@@ -440,13 +586,36 @@ with st.sidebar:
             n += 1; key = f"custom{n}"
         D()["custom_types"].append({"key": key, "name": f"Новый тип документа {n}", "var_tokens": ["name"]})
         D()["texts"][key] = "# НОВЫЙ ДОКУМЕНТ\n\nClient: {name}\n\n(добавь поля и текст ниже)"
+        D().setdefault("type_created", {})[key] = date.today().isoformat()
         save_data(); goto(key, "template"); st.rerun()
 
+    arch = D().get("archived", {})
+    if arch:
+        st.divider()
+        with st.expander(f"🗄 Архив ({len(arch)})"):
+            for key in list(arch.keys()):
+                created = fmt_iso(D().get("type_created", {}).get(key, ""))
+                deleted = fmt_iso(arch[key])
+                st.markdown(f"**{type_name(key)}**  \n<span style='font-size:11px;color:gray'>"
+                            f"создан: {created} · удалён: {deleted}</span>", unsafe_allow_html=True)
+                if st.button("↩️ Восстановить", key=f"restore_{key}", use_container_width=True):
+                    restore_type(key); save_data(); goto(key, "create"); st.rerun()
+
+    st.divider()
+    src = st.session_state.get("storage_src", "local")
+    label = {"gsheets": "🟢 Google-таблица", "local": "🟡 локально (сбросится при перезапуске)",
+             "empty": "🟡 локально"}.get(src, src)
+    st.caption(f"Хранение: {label}")
+
 # ---------------- контент ----------------
+types_now = all_types()
+if st.session_state.type not in [x["key"] for x in types_now]:
+    st.session_state.type = types_now[0]["key"] if types_now else None
 t = get_type(st.session_state.type)
 sec = st.session_state.section
 if t is None:
-    st.warning("Тип документа не найден."); st.stop()
+    st.info("Все типы документов в архиве. Восстанови нужный из раздела «Архив» слева.")
+    st.stop()
 
 # ===== СОЗДАТЬ =====
 if sec == "create":
@@ -455,17 +624,30 @@ if sec == "create":
         st.caption("Шаг 1 из 2 — данные")
         form, extra = render_form(t)
         if st.button("Далее — предпросмотр →", type="primary"):
-            ok = True
+            errs = []
             if t["kind"] in ("freeze", "extension"):
-                ok = bool(form["client_name"]) and bool(form["selected_plan"])
-            if not ok:
-                st.error("Заполни имя клиента и план.")
+                if not form["client_name"]:
+                    errs.append("Имя клиента")
+                if not form["selected_plan"]:
+                    errs.append("План")
+            # обязательные пользовательские/доп. поля
+            for tok in all_tokens(t):
+                v = var_get(tok)
+                if v.get("required") and (tok in form or tok in extra):
+                    val = form.get(tok, extra.get(tok))
+                    if v["type"] == "text" and not str(val or "").strip():
+                        errs.append(v["label"])
+            if errs:
+                st.error("Заполни обязательные поля: " + ", ".join(errs) + ".")
             else:
                 r = compute_full(t, form, extra)
                 if r["err"]:
                     st.error(r["err"])
                 else:
                     st.session_state.cur_ctx = r["ctx"]
+                    sf, se = serialize_form(form, extra)
+                    st.session_state.cur_form = sf
+                    st.session_state.cur_extra = se
                     st.session_state.step = 2
                     st.rerun()
     else:
@@ -482,7 +664,7 @@ if sec == "create":
         st.write("")
         docx_bytes = E.build_docx(text_of(t["key"]), ctx, client)
         fname = f"{E.safe_name(client)}_{t['key']}"
-        b1, b2, b3 = st.columns(3)
+        b1, b2, b3, b4 = st.columns(4)
         with b1:
             if st.button("← Назад", use_container_width=True):
                 st.session_state.step = 1; st.rerun()
@@ -491,23 +673,24 @@ if sec == "create":
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 use_container_width=True)
         with b3:
+            if E._find_soffice():
+                try:
+                    pdf_bytes = cached_pdf(text_of(t["key"]), json.dumps(ctx, ensure_ascii=False), client)
+                    st.download_button("⬇️ PDF", pdf_bytes, file_name=fname + ".pdf",
+                        mime="application/pdf", use_container_width=True)
+                except Exception:
+                    st.caption("PDF —")
+            else:
+                st.caption("нет PDF")
+        with b4:
             if st.button("💾 Сохранить", type="primary", use_container_width=True):
                 D()["saved"].setdefault(t["key"], []).insert(0, {
                     "client": client or "—", "date": date.today().strftime(E.DATE_FMT),
-                    "type_name": t["name"], "text": text_of(t["key"]), "ctx": ctx})
+                    "created_iso": date.today().isoformat(),
+                    "type_name": t["name"], "text": text_of(t["key"]), "ctx": ctx,
+                    "form": st.session_state.get("cur_form", {}),
+                    "extra": st.session_state.get("cur_extra", {})})
                 save_data(); st.success("Сохранено в «созданные документы».")
-        if E._find_soffice():
-            if st.button("📄 Сгенерировать PDF"):
-                try:
-                    st.session_state.pdf = E.docx_to_pdf_bytes(docx_bytes)
-                    st.session_state.pdf_name = fname + ".pdf"
-                except Exception as e:
-                    st.error(f"PDF не создан: {e}")
-            if st.session_state.get("pdf"):
-                st.download_button("⬇️ Скачать PDF", st.session_state.pdf,
-                    file_name=st.session_state.get("pdf_name", "doc.pdf"), mime="application/pdf")
-        else:
-            st.caption("PDF недоступен (нет LibreOffice).")
 
 # ===== ШАБЛОН =====
 elif sec == "template":
@@ -545,6 +728,8 @@ elif sec == "template":
             ntok = st.text_input("Токен (латиницей, без пробелов)", key=f"nt_{t['key']}")
             ntype_label = st.selectbox("Тип", [l for _, l in type_labels], key=f"nty_{t['key']}")
             ntype = dict((l, v) for v, l in type_labels)[ntype_label]
+            nreq = st.checkbox("Обязательное поле", key=f"nreq_{t['key']}",
+                               help="Нельзя будет создать документ, пока поле не заполнено")
             base = dur = None
             if ntype == "calc_date":
                 date_toks = [tok for tok in cur_toks if var_get(tok)["type"] == "date"]
@@ -568,7 +753,7 @@ elif sec == "template":
                 elif ntype == "calc_date" and not (base and dur):
                     st.error("Для вычисляемой даты нужны переменная-дата и переменная-длительность.")
                 else:
-                    nv = {"token": tok, "label": nl or tok, "type": ntype}
+                    nv = {"token": tok, "label": nl or tok, "type": ntype, "required": bool(nreq)}
                     if ntype == "calc_date":
                         nv["base"] = base; nv["dur"] = dur
                     variables().append(nv)
@@ -614,6 +799,27 @@ elif sec == "template":
         else:
             st.session_state.pending_del_var = None
 
+    with st.expander("🔎 Все переменные / обязательность"):
+        TYPE_RU = {"text": "текст", "date": "дата", "number": "число",
+                   "dur_days": "дни", "dur_months": "месяцы", "calc_date": "вычисл. дата"}
+        vq = st.text_input("Поиск переменной", key="varsearch",
+                           placeholder="по названию или токену…").strip().lower()
+        rows = [v for v in variables()
+                if not vq or vq in v["label"].lower() or vq in v["token"].lower()]
+        if not rows:
+            st.caption("Ничего не найдено.")
+        for v in rows:
+            c = st.columns([5, 2, 2])
+            c[0].markdown(f"`{{{v['token']}}}` — {v['label']}")
+            c[1].caption(TYPE_RU.get(v["type"], v["type"]))
+            if v["type"] == "text":
+                newreq = c[2].checkbox("обяз.", value=bool(v.get("required")),
+                                       key=f"req_{v['token']}")
+                if newreq != bool(v.get("required")):
+                    v["required"] = newreq; save_data(); st.rerun()
+            else:
+                c[2].caption("—")
+
     a1, a2 = st.columns(2)
     with a1:
         if st.button("💾 Сохранить шаблон", type="primary", use_container_width=True):
@@ -636,11 +842,17 @@ elif sec == "created":
     if not saved:
         st.info("Пока пусто. Создай и сохрани документ.")
     else:
-        for i, e in enumerate(saved):
+        dq = st.text_input("🔎 Поиск по имени клиента", key=f"docsearch_{t['key']}",
+                           placeholder="имя клиента…").strip().lower()
+        shown = [(i, e) for i, e in enumerate(saved)
+                 if not dq or dq in str(e.get("client", "")).lower()]
+        if not shown:
+            st.caption("Ничего не найдено.")
+        for i, e in shown:
             with st.container(border=True):
-                c = st.columns([4, 1, 1])
+                c = st.columns([4, 1, 1, 1, 1])
                 c[0].markdown(f"**{e['client']}**  \n<span style='color:gray;font-size:12px'>"
-                              f"{e['date']} · {e['type_name']}</span>", unsafe_allow_html=True)
+                              f"создан: {e['date']} · {e['type_name']}</span>", unsafe_allow_html=True)
                 client = e["ctx"].get("name", e.get("client", ""))
                 docx_bytes = E.build_docx(e["text"], e["ctx"], client)
                 fname = f"{E.safe_name(e['client'])}_{t['key']}"
@@ -648,11 +860,18 @@ elif sec == "created":
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                     key=f"dl_{t['key']}_{i}", use_container_width=True)
                 if E._find_soffice():
-                    if c[2].button("PDF", key=f"pdf_{t['key']}_{i}", use_container_width=True):
-                        try:
-                            st.session_state[f"sp_{t['key']}_{i}"] = E.docx_to_pdf_bytes(docx_bytes)
-                        except Exception as ex:
-                            st.error(f"PDF не создан: {ex}")
-                    if st.session_state.get(f"sp_{t['key']}_{i}"):
-                        st.download_button("⬇️ Скачать PDF", st.session_state[f"sp_{t['key']}_{i}"],
-                            file_name=fname + ".pdf", mime="application/pdf", key=f"dlp_{t['key']}_{i}")
+                    try:
+                        pdf_bytes = cached_pdf(e["text"], json.dumps(e["ctx"], ensure_ascii=False), client)
+                        c[2].download_button("⬇️ PDF", pdf_bytes, file_name=fname + ".pdf",
+                            mime="application/pdf", key=f"dlp_{t['key']}_{i}", use_container_width=True)
+                    except Exception:
+                        c[2].caption("PDF —")
+                if c[3].button("✏️ Изменить", key=f"edit_{t['key']}_{i}", use_container_width=True):
+                    repopulate(t, e.get("form", {}), e.get("extra", {}))
+                    goto(t["key"], "create")
+                    st.session_state.step = 1
+                    st.rerun()
+                with c[4].popover("🗑", use_container_width=True):
+                    st.write("Удалить документ безвозвратно?")
+                    if st.button("Да, удалить", key=f"deldoc_{t['key']}_{i}", type="primary"):
+                        saved.pop(i); save_data(); st.rerun()
