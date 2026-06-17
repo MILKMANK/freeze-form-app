@@ -46,14 +46,15 @@ BUILTIN_ORDER = ["freeze", "extension"]
 # ---------------- хранилище ----------------
 def load_data():
     d = {"texts": {}, "custom_types": [], "saved": {}, "variables": [], "extra_tokens": {},
-         "type_created": {}, "archived": {}, "required": {}}
+         "type_created": {}, "archived": {}, "required": {}, "deleted_defaults": []}
     loaded, src = storage.load(DATA_FILE)
     st.session_state["storage_src"] = src
     if loaded:
         d.update(loaded)
     have = {v["token"] for v in d.get("variables", [])}
+    gone = set(d.get("deleted_defaults", []))
     for v in DEFAULT_VARS:
-        if v["token"] not in have:
+        if v["token"] not in have and v["token"] not in gone:
             d.setdefault("variables", []).append(dict(v))
     # миграция старых типов: гарантируем наличие var_tokens
     for ct in d.get("custom_types", []):
@@ -164,7 +165,8 @@ def fields_of(t):
         v = var_get(tok)
         out.append({"key": tok, "token": tok, "label": v["label"], "type": v["type"],
                     "base": v.get("base"), "dur": v.get("dur"),
-                    "expr": v.get("expr"), "out": v.get("out")})
+                    "expr": v.get("expr"), "out": v.get("out"),
+                    "default_expr": v.get("default_expr")})
     return out
 
 
@@ -248,6 +250,10 @@ def sync_type_with_text(t):
             for ref in E.refs_in(v.get("expr", "")):
                 if ref not in all_tokens(t):
                     add_token_to_type(t, ref); changed = True
+        if v.get("default_expr"):
+            for ref in E.refs_in(v.get("default_expr", "")):
+                if ref not in all_tokens(t):
+                    add_token_to_type(t, ref); changed = True
     req = required_tokens(t)
     pruned = [tok for tok in req if in_text(t, tok)]
     if pruned != req:
@@ -300,6 +306,14 @@ def delete_variable_everywhere(token):
             for tk in toks:
                 txt = txt.replace("{" + tk + "}", "")
             D()["texts"][k] = txt
+    # системные токены помечаем удалёнными, чтобы не пересоздавались при загрузке
+    dd = D().setdefault("deleted_defaults", [])
+    for tk in toks:
+        if tk in DEFAULT_TOKENS and tk not in dd:
+            dd.append(tk)
+    # также убираем из обязательных по типам
+    for k in list(D().get("required", {}).keys()):
+        D()["required"][k] = [x for x in D()["required"][k] if x not in toks]
 
 
 def text_of(tk):
@@ -334,6 +348,30 @@ def linked_expiration(ns, start_key, label):
     if not st.session_state[tch]:
         st.session_state[exp_key] = E.add_months(st.session_state[start_key], 6)
     return st.date_input(label, key=exp_key, on_change=_mark, args=(tch,))
+
+
+def compute_default(expr, ns, out_type):
+    """Значение по умолчанию из формулы, опираясь на другие поля (по их ключам ns+token)."""
+    try:
+        env = {}
+        for ref in E.refs_in(expr):
+            v = st.session_state.get(ns + ref)
+            if isinstance(v, date):
+                env[ref] = float(v.toordinal())
+            elif isinstance(v, bool):
+                env[ref] = float(v)
+            elif isinstance(v, (int, float)):
+                env[ref] = float(v)
+            elif v in (None, ""):
+                env[ref] = None
+            else:
+                env[ref] = str(v)
+        val = E.evaluate_formula(expr, env)
+        if out_type == "date":
+            return date.fromordinal(int(round(float(val))))
+        return int(round(float(val)))
+    except Exception:
+        return date.today() if out_type == "date" else 0
 
 
 def _render_extra(t, ns):
@@ -412,20 +450,40 @@ def render_form(t):
         inputs = [f for f in flds if f["type"] not in ("calc_date", "formula")]
         if not inputs:
             st.info("У этого типа пока нет полей для ввода. Добавь их в разделе «шаблон».")
-        for f in flds:
-            tp = f["type"]
-            if tp in ("calc_date", "formula"):
-                continue
-            key = ns + f["key"]
+
+        def _render_field(f):
+            tp = f["type"]; key = ns + f["key"]
+            dx = f.get("default_expr")
             if tp == "date":
-                _ensure(key, date.today())
-                form[f["key"]] = st.date_input(f["label"], key=key)
+                if dx:
+                    tk = key + "_touched"; dflt = compute_default(dx, ns, "date")
+                    _ensure(key, dflt); _ensure(tk, False)
+                    if not st.session_state[tk]:
+                        st.session_state[key] = dflt
+                    form[f["key"]] = st.date_input(f["label"], key=key, on_change=_mark, args=(tk,))
+                else:
+                    _ensure(key, date.today())
+                    form[f["key"]] = st.date_input(f["label"], key=key)
             elif tp in ("number", "dur_days", "dur_months"):
                 lbl = f["label"] + (" (дней)" if tp == "dur_days" else " (мес.)" if tp == "dur_months" else "")
-                form[f["key"]] = st.number_input(lbl, value=None, step=1, key=key,
-                                                 placeholder="число (пусто = 0)")
+                if dx:
+                    tk = key + "_touched"; dflt = compute_default(dx, ns, "number")
+                    _ensure(key, dflt); _ensure(tk, False)
+                    if not st.session_state[tk]:
+                        st.session_state[key] = dflt
+                    form[f["key"]] = st.number_input(lbl, step=1, key=key, on_change=_mark, args=(tk,))
+                else:
+                    form[f["key"]] = st.number_input(lbl, value=None, step=1, key=key,
+                                                     placeholder="число (пусто = 0)")
             else:
                 form[f["key"]] = st.text_input(f["label"], key=key)
+
+        plain = [f for f in inputs if not f.get("default_expr")]
+        withdef = [f for f in inputs if f.get("default_expr")]
+        for f in plain:
+            _render_field(f)
+        for f in withdef:
+            _render_field(f)
         return form, {}
 
 
@@ -923,6 +981,20 @@ elif sec == "template":
                     format_func=lambda x: f"{var_get(x)['label']}  ·  {{{x}}}", key=f"cb_{t['key']}")
                 dur = st.selectbox("Длительность", dur_toks,
                     format_func=lambda x: f"{var_get(x)['label']}  ·  {{{x}}}", key=f"cd_{t['key']}")
+        defx = ""
+        if ntype in ("date", "number", "dur_days", "dur_months"):
+            defx = st.text_input("Значение по умолчанию — формула (необязательно, поле останется редактируемым)",
+                                 key=f"dx_{t['key']}",
+                                 placeholder="напр. EDATE({start_date}; 6) — дата = старт + 6 мес.")
+            if defx and defx.strip():
+                try:
+                    tenv = {v["token"]: (float(date.today().toordinal()) if v["type"] in ("date", "calc_date", "formula")
+                                         else 1.0 if v["type"] in ("number", "dur_days", "dur_months")
+                                         else "текст") for v in variables()}
+                    E.evaluate_formula(defx, tenv)
+                    st.caption("✅ Формула значения по умолчанию разобрана без ошибок.")
+                except Exception as ex:
+                    st.warning(f"Проверь формулу по умолчанию: {ex}")
         if st.button("Создать переменную", key=f"addnew_{t['key']}"):
             tok = "".join(ch for ch in ntok if ch.isalnum() or ch == "_")
             if not tok:
@@ -939,16 +1011,22 @@ elif sec == "template":
                     nv["base"] = base; nv["dur"] = dur
                 elif ntype == "formula":
                     nv["expr"] = fexpr.strip(); nv["out"] = fout
+                if defx and defx.strip() and ntype in ("date", "number", "dur_days", "dur_months"):
+                    nv["default_expr"] = defx.strip()
                 variables().append(nv); save_data(); st.rerun()
 
     with st.expander("🗑 Удалить переменную совсем (из всех документов)"):
-        deletable = [v for v in variables() if v["token"] not in DEFAULT_TOKENS]
-        if not deletable:
-            st.caption("Своих переменных пока нет. Системные переменные удалять нельзя.")
+        allv = list(variables())
+        if not allv:
+            st.caption("Переменных пока нет.")
         else:
-            labels = [f"{v['label']}  ·  {{{v['token']}}}" for v in deletable]
+            labels = [f"{v['label']}  ·  {{{v['token']}}}"
+                      + ("  · системная" if v["token"] in DEFAULT_TOKENS else "") for v in allv]
             dv = st.selectbox("Переменная", labels, key="delsel")
-            dtok = deletable[labels.index(dv)]["token"]
+            dtok = allv[labels.index(dv)]["token"]
+            if dtok in DEFAULT_TOKENS:
+                st.caption("⚠️ Это системная переменная — её используют встроенные типы Freeze / Extension. "
+                           "Удаляй только если точно понимаешь последствия.")
             if st.button("Удалить переменную везде", key="delbtn"):
                 st.session_state.pending_del_var = dtok
                 st.rerun()
@@ -961,10 +1039,13 @@ elif sec == "template":
                 used = ", ".join(f"«{n}» (×{c} в тексте)" for n, c, _ in usage)
             else:
                 used = "нигде"
+            sys_note = ("\n\n⚠️ Это **системная** переменная встроенных типов — после удаления "
+                        "соответствующие поля в Freeze / Extension могут перестать подставляться."
+                        if tok in DEFAULT_TOKENS else "")
             st.warning(f"Точно удалить переменную **{{{tok}}}**?\n\n"
                        f"Используется в: {used}.\n\n"
                        f"Она будет удалена из всех документов и убрана из всех текстов. "
-                       f"Это действие необратимо.")
+                       f"Это действие необратимо.{sys_note}")
             cc = st.columns(2)
             if cc[0].button("Да, удалить везде", type="primary", key="del_yes"):
                 delete_variable_everywhere(tok)
