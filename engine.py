@@ -61,7 +61,11 @@ def compute_fields(defs: list, form: dict) -> dict:
         if tp == "date":
             val = form.get(tok); raw[tok] = val
             ctx[tok] = fmt(val) if val else "—"
-        elif tp in ("text", "number", "dur_days", "dur_months"):
+        elif tp in ("number", "dur_days", "dur_months"):
+            val = form.get(tok)
+            n = 0 if val in (None, "") else int(val)
+            raw[tok] = n; ctx[tok] = str(n)
+        elif tp == "text":
             val = form.get(tok); raw[tok] = val
             ctx[tok] = "" if val in (None, "") else str(val)
     for v in defs:
@@ -70,8 +74,8 @@ def compute_fields(defs: list, form: dict) -> dict:
             durtok = v.get("dur")
             dur = raw.get(durtok)
             unit = DURATION_UNIT.get(tmap.get(durtok), "days")
-            if base and dur not in (None, ""):
-                d = add_duration(base, int(dur), unit)
+            if base:
+                d = add_duration(base, int(dur or 0), unit)
                 raw[v["token"]] = d; ctx[v["token"]] = fmt(d)
             else:
                 ctx[v["token"]] = "—"

@@ -46,7 +46,7 @@ BUILTIN_ORDER = ["freeze", "extension"]
 # ---------------- хранилище ----------------
 def load_data():
     d = {"texts": {}, "custom_types": [], "saved": {}, "variables": [], "extra_tokens": {},
-         "type_created": {}, "archived": {}}
+         "type_created": {}, "archived": {}, "required": {}}
     loaded, src = storage.load(DATA_FILE)
     st.session_state["storage_src"] = src
     if loaded:
@@ -211,6 +211,62 @@ def remove_token_from_type(t, tok):
             ct["var_tokens"].remove(tok)
 
 
+TYPE_RU = {"text": "текст", "date": "дата", "number": "число",
+           "dur_days": "длительность (дни)", "dur_months": "длительность (мес.)",
+           "calc_date": "вычисляемая дата"}
+
+
+def in_text(t, tok):
+    return ("{" + tok + "}") in (text_of(t["key"]) or "")
+
+
+def required_tokens(t):
+    return D().setdefault("required", {}).setdefault(t["key"], [])
+
+
+def sync_type_with_text(t):
+    """Переменные, встречающиеся в тексте, становятся полями документа.
+       Вычисляемым датам добавляем их базу и длительность.
+       Обязательность снимается с тех, кого в тексте уже нет."""
+    changed = False
+    txt = text_of(t["key"]) or ""
+    for v in variables():
+        tok = v["token"]
+        if tok in all_tokens(t):
+            continue
+        if ("{" + tok + "}") in txt:
+            add_token_to_type(t, tok); changed = True
+    # базе/длительности вычисляемых дат нужны свои поля
+    for tok in list(all_tokens(t)):
+        v = var_get(tok)
+        if v.get("type") == "calc_date":
+            for ref in (v.get("base"), v.get("dur")):
+                if ref and ref not in all_tokens(t):
+                    add_token_to_type(t, ref); changed = True
+    req = required_tokens(t)
+    pruned = [tok for tok in req if in_text(t, tok)]
+    if pruned != req:
+        req[:] = pruned; changed = True
+    return changed
+
+
+def set_required(t, tok, value):
+    req = required_tokens(t)
+    if value and in_text(t, tok):
+        if tok not in req:
+            req.append(tok)
+    else:
+        if tok in req:
+            req.remove(tok)
+
+
+def editor_vars(t):
+    """Все переменные программы для правой панели: [token, label, тип-текст, обязательна?]."""
+    req = set(required_tokens(t))
+    return [[v["token"], v["label"], TYPE_RU.get(v["type"], v["type"]), v["token"] in req]
+            for v in variables()]
+
+
 def variable_usage(token):
     """Где используется переменная: [(имя типа, кол-во в тексте, есть в полях)]."""
     res = []
@@ -292,7 +348,8 @@ def _render_extra(t, ns):
             extra[tok] = st.date_input(v["label"], key=key)
         elif tp in ("number", "dur_days", "dur_months"):
             lbl = v["label"] + (" (дней)" if tp == "dur_days" else " (мес.)" if tp == "dur_months" else "")
-            extra[tok] = st.number_input(lbl, value=0, step=1, key=key)
+            extra[tok] = st.number_input(lbl, value=None, step=1, key=key,
+                                         placeholder="число (пусто = 0)")
         else:
             extra[tok] = st.text_input(v["label"], key=key)
     return extra
@@ -360,7 +417,8 @@ def render_form(t):
                 form[f["key"]] = st.date_input(f["label"], key=key)
             elif tp in ("number", "dur_days", "dur_months"):
                 lbl = f["label"] + (" (дней)" if tp == "dur_days" else " (мес.)" if tp == "dur_months" else "")
-                form[f["key"]] = st.number_input(lbl, value=0, step=1, key=key)
+                form[f["key"]] = st.number_input(lbl, value=None, step=1, key=key,
+                                                 placeholder="число (пусто = 0)")
             else:
                 form[f["key"]] = st.text_input(f["label"], key=key)
         return form, {}
@@ -372,19 +430,24 @@ def compute_full(t, form, extra):
         return r
     ctx = dict(r["ctx"]); raw = dict(r.get("raw", {}))
     for tok, val in (extra or {}).items():
-        raw[tok] = val
         vt = var_get(tok)["type"]
         if vt == "date":
+            raw[tok] = val
             ctx[tok] = E.fmt(val) if val else "—"
+        elif vt in ("number", "dur_days", "dur_months"):
+            n = 0 if val in (None, "") else int(val)
+            raw[tok] = n; ctx[tok] = str(n)
         else:
+            raw[tok] = val
             ctx[tok] = "" if val in (None, "") else str(val)
     for tok in extra_tokens(t):
         v = var_get(tok)
         if v["type"] == "calc_date":
-            base = raw.get(v.get("base")); durtok = v.get("dur"); dur = raw.get(durtok)
+            base = raw.get(v.get("base")); durtok = v.get("dur")
+            dur = raw.get(durtok)
             unit = E.DURATION_UNIT.get(var_get(durtok)["type"], "days") if durtok else "days"
-            if base and dur not in (None, ""):
-                d = E.add_duration(base, int(dur), unit)
+            if base:
+                d = E.add_duration(base, int(dur or 0), unit)
                 raw[tok] = d; ctx[tok] = E.fmt(d)
             else:
                 ctx[tok] = "—"
@@ -690,6 +753,9 @@ if t is None:
     st.info("Все типы документов в архиве. Восстанови нужный из раздела «Архив» слева.")
     st.stop()
 
+if sync_type_with_text(t):
+    save_data()
+
 # ===== СОЗДАТЬ =====
 if sec == "create":
     st.title(f"{t['name']} — создать")
@@ -703,13 +769,23 @@ if sec == "create":
                     errs.append("Имя клиента")
                 if not form["selected_plan"]:
                     errs.append("План")
-            # обязательные пользовательские/доп. поля
-            for tok in all_tokens(t):
+            base_map = {"name": "client_name", "plan": "selected_plan",
+                        "orig_expiration": "orig_exp", "current_expiration": "current_exp",
+                        "extension_months": "ext_months"}
+            for tok in required_tokens(t):
                 v = var_get(tok)
-                if v.get("required") and (tok in form or tok in extra):
-                    val = form.get(tok, extra.get(tok))
-                    if v["type"] == "text" and not str(val or "").strip():
-                        errs.append(v["label"])
+                ty = v["type"]
+                if ty in ("date", "calc_date"):
+                    continue
+                if tok in extra:
+                    val = extra.get(tok)
+                elif tok in form:
+                    val = form.get(tok)
+                else:
+                    val = form.get(base_map.get(tok, tok))
+                empty = (val is None) or (ty == "text" and not str(val).strip())
+                if empty and v["label"] not in errs:
+                    errs.append(v["label"])
             if errs:
                 st.error("Заполни обязательные поля: " + ", ".join(errs) + ".")
             else:
@@ -773,7 +849,7 @@ elif sec == "template":
         ct["name"] = st.text_input("Название типа документа", ct["name"])
 
     st.markdown("**Текст документа** — таблица подписей добавляется автоматически в конце.")
-    ret = template_editor(text=text_of(t["key"]), variables=vars_panel(t),
+    ret = template_editor(text=text_of(t["key"]), variables=editor_vars(t),
                           key=f"editor_{t['key']}_{st.session_state.editor_nonce}")
     if isinstance(ret, dict):
         txt = ret.get("text")
@@ -782,59 +858,52 @@ elif sec == "template":
         cmd = ret.get("cmd")
         if cmd and cmd.get("id") and cmd.get("id") != st.session_state.get("last_cmd_id"):
             st.session_state["last_cmd_id"] = cmd["id"]
-            if cmd.get("action") == "del" and cmd.get("token"):
-                remove_token_from_type(t, cmd["token"])
+            act = cmd.get("action"); tok = cmd.get("token")
+            if act == "del" and tok:
+                remove_token_from_type(t, tok)
+                if tok in required_tokens(t):
+                    required_tokens(t).remove(tok)
+                save_data(); st.rerun()
+            elif act == "req" and tok:
+                set_required(t, tok, bool(cmd.get("value")))
                 save_data(); st.rerun()
     elif ret is not None:
         D()["texts"][t["key"]] = ret
 
-    with st.expander("➕ Добавить / создать переменную"):
-        cur_toks = all_tokens(t)
-        avail = [v for v in variables() if v["token"] not in cur_toks]
-        opts = ["➕ Создать новую переменную"] + [f"{v['label']}  ·  {{{v['token']}}}" for v in avail]
-        choice = st.selectbox("Переменная", opts, key=f"addsel_{t['key']}")
-        if choice == "➕ Создать новую переменную":
-            type_labels = [("text", "текст"), ("date", "дата"), ("number", "число"),
-                           ("dur_days", "длительность (дни)"), ("dur_months", "длительность (месяцы)"),
-                           ("calc_date", "вычисляемая дата (дата + длительность)")]
-            nl = st.text_input("Название (метка)", key=f"nl_{t['key']}")
-            ntok = st.text_input("Токен (латиницей, без пробелов)", key=f"nt_{t['key']}")
-            ntype_label = st.selectbox("Тип", [l for _, l in type_labels], key=f"nty_{t['key']}")
-            ntype = dict((l, v) for v, l in type_labels)[ntype_label]
-            nreq = st.checkbox("Обязательное поле", key=f"nreq_{t['key']}",
-                               help="Нельзя будет создать документ, пока поле не заполнено")
-            base = dur = None
-            if ntype == "calc_date":
-                date_toks = [tok for tok in cur_toks if var_get(tok)["type"] == "date"]
-                dur_toks = [tok for tok in cur_toks if var_get(tok)["type"] in ("dur_days", "dur_months")]
-                if not date_toks or not dur_toks:
-                    st.info("Сначала добавь в этот документ переменную-дату и переменную-длительность, "
-                            "потом создавай вычисляемую дату.")
-                else:
-                    base = st.selectbox("База (дата)",
-                        date_toks, format_func=lambda x: f"{var_get(x)['label']}  ·  {{{x}}}",
-                        key=f"cb_{t['key']}")
-                    dur = st.selectbox("Длительность",
-                        dur_toks, format_func=lambda x: f"{var_get(x)['label']}  ·  {{{x}}}",
-                        key=f"cd_{t['key']}")
-            if st.button("Создать и добавить", key=f"addnew_{t['key']}"):
-                tok = "".join(ch for ch in ntok if ch.isalnum() or ch == "_")
-                if not tok:
-                    st.error("Укажи токен.")
-                elif any(v["token"] == tok for v in variables()):
-                    st.error("Такой токен уже есть — выбери его из списка.")
-                elif ntype == "calc_date" and not (base and dur):
-                    st.error("Для вычисляемой даты нужны переменная-дата и переменная-длительность.")
-                else:
-                    nv = {"token": tok, "label": nl or tok, "type": ntype, "required": bool(nreq)}
-                    if ntype == "calc_date":
-                        nv["base"] = base; nv["dur"] = dur
-                    variables().append(nv)
-                    add_token_to_type(t, tok); save_data(); st.rerun()
-        else:
-            if st.button("Добавить", key=f"addex_{t['key']}"):
-                tok = avail[opts.index(choice) - 1]["token"]
-                add_token_to_type(t, tok); save_data(); st.rerun()
+    with st.expander("➕ Создать новую переменную"):
+        st.caption("Создай переменную — затем кликни её в списке справа, чтобы вставить в текст.")
+        type_labels = [("text", "текст"), ("date", "дата"), ("number", "число"),
+                       ("dur_days", "длительность (дни)"), ("dur_months", "длительность (месяцы)"),
+                       ("calc_date", "вычисляемая дата (дата + длительность)")]
+        nl = st.text_input("Название (метка)", key=f"nl_{t['key']}")
+        ntok = st.text_input("Токен (латиницей, без пробелов)", key=f"nt_{t['key']}")
+        ntype_label = st.selectbox("Тип", [l for _, l in type_labels], key=f"nty_{t['key']}")
+        ntype = dict((l, v) for v, l in type_labels)[ntype_label]
+        base = dur = None
+        if ntype == "calc_date":
+            date_toks = [v["token"] for v in variables() if v["type"] == "date"]
+            dur_toks = [v["token"] for v in variables() if v["type"] in ("dur_days", "dur_months")]
+            if not date_toks or not dur_toks:
+                st.info("Сначала создай переменную-дату и переменную-длительность, "
+                        "потом — вычисляемую дату.")
+            else:
+                base = st.selectbox("База (дата)", date_toks,
+                    format_func=lambda x: f"{var_get(x)['label']}  ·  {{{x}}}", key=f"cb_{t['key']}")
+                dur = st.selectbox("Длительность", dur_toks,
+                    format_func=lambda x: f"{var_get(x)['label']}  ·  {{{x}}}", key=f"cd_{t['key']}")
+        if st.button("Создать переменную", key=f"addnew_{t['key']}"):
+            tok = "".join(ch for ch in ntok if ch.isalnum() or ch == "_")
+            if not tok:
+                st.error("Укажи токен.")
+            elif any(v["token"] == tok for v in variables()):
+                st.error("Такой токен уже есть.")
+            elif ntype == "calc_date" and not (base and dur):
+                st.error("Для вычисляемой даты нужны переменная-дата и переменная-длительность.")
+            else:
+                nv = {"token": tok, "label": nl or tok, "type": ntype}
+                if ntype == "calc_date":
+                    nv["base"] = base; nv["dur"] = dur
+                variables().append(nv); save_data(); st.rerun()
 
     with st.expander("🗑 Удалить переменную совсем (из всех документов)"):
         deletable = [v for v in variables() if v["token"] not in DEFAULT_TOKENS]
@@ -871,27 +940,6 @@ elif sec == "template":
                 st.rerun()
         else:
             st.session_state.pending_del_var = None
-
-    with st.expander("🔎 Все переменные / обязательность"):
-        TYPE_RU = {"text": "текст", "date": "дата", "number": "число",
-                   "dur_days": "дни", "dur_months": "месяцы", "calc_date": "вычисл. дата"}
-        vq = st.text_input("Поиск переменной", key="varsearch",
-                           placeholder="по названию или токену…").strip().lower()
-        rows = [v for v in variables()
-                if not vq or vq in v["label"].lower() or vq in v["token"].lower()]
-        if not rows:
-            st.caption("Ничего не найдено.")
-        for v in rows:
-            c = st.columns([5, 2, 2])
-            c[0].markdown(f"`{{{v['token']}}}` — {v['label']}")
-            c[1].caption(TYPE_RU.get(v["type"], v["type"]))
-            if v["type"] == "text":
-                newreq = c[2].checkbox("обяз.", value=bool(v.get("required")),
-                                       key=f"req_{v['token']}")
-                if newreq != bool(v.get("required")):
-                    v["required"] = newreq; save_data(); st.rerun()
-            else:
-                c[2].caption("—")
 
     a1, a2 = st.columns(2)
     with a1:
