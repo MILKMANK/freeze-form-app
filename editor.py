@@ -1,9 +1,10 @@
 """
-Визуальный редактор шаблона (WYSIWYG). Жирный показывается жирным, заголовки —
-заголовками; разметка (** и #) не видна. При сохранении область сериализуется
-обратно в markdown (**жирный**, # / ##, {token}), который понимает движок.
-Справа — все переменные программы (поиск, активные/приглушённые, ×N, мусорка,
-чекбокс «обяз.», тип). Команды в приложение: {action:'del'} и {action:'req',value}.
+Визуальный редактор шаблона (WYSIWYG), устойчивая версия.
+Жирный/курсив применяются в пределах ОДНОЙ строки (не «растекаются»),
+заголовки H1/H2 переключаются по строке вручную. Разметка (** и #) не видна.
+При сохранении область сериализуется обратно в markdown (**жирный**, *курсив*,
+# / ##, {token}). Справа — все переменные (поиск, активные/приглушённые, ×N,
+мусорка, чекбокс «обяз.», тип). Команды: {action:'del'} и {action:'req',value}.
 Возвращает {text, cmd}.
 """
 import os, tempfile
@@ -55,12 +56,12 @@ _HTML = r"""<!doctype html><html><head><meta charset="utf-8">
   <div class="row">
     <div class="left">
       <div class="tb">
-        <button data-c="bold" title="Жирный"><b>Ж</b></button>
-        <button data-c="italic" title="Курсив"><i>К</i></button>
-        <button data-b="h1" title="Заголовок">H1</button>
-        <button data-b="h2" title="Подзаголовок">H2</button>
+        <button data-c="bold" title="Жирный (к выделенному тексту)"><b>Ж</b></button>
+        <button data-c="italic" title="Курсив (к выделенному тексту)"><i>К</i></button>
+        <button data-b="h1" title="Заголовок (вся строка)">H1</button>
+        <button data-b="h2" title="Подзаголовок (вся строка)">H2</button>
       </div>
-      <div class="hint">Выдели текст и нажми Ж / К / H1 / H2 — символы разметки не показываются (визуальный редактор)</div>
+      <div class="hint">Ж / К — выдели текст в одной строке. H1 / H2 — встань на строку. Символы разметки не показываются (визуальный редактор v8).</div>
       <div id="ed" class="editor" contenteditable="true" spellcheck="false"></div>
     </div>
     <div class="right">
@@ -73,6 +74,7 @@ _HTML = r"""<!doctype html><html><head><meta charset="utf-8">
   var inited=false, debTimer=null, pendingCmd=null, allVars=[];
   var ed=document.getElementById('ed'), vsearch=document.getElementById('vsearch');
   try{ document.execCommand('styleWithCSS', false, false); }catch(e){}
+  var BLOCKS=['DIV','P','H1','H2'];
 
   function post(type, extra){ var m={isStreamlitMessage:true,type:type};
     if(extra){for(var k in extra)m[k]=extra[k];} window.parent.postMessage(m,'*'); }
@@ -85,6 +87,7 @@ _HTML = r"""<!doctype html><html><head><meta charset="utf-8">
     s.setAttribute('contenteditable','false'); s.setAttribute('data-tok',tok);
     s.textContent='{'+tok+'}'; return s; }
 
+  // ---------- сериализация DOM -> markdown ----------
   function serNode(n){
     if(n.nodeType===3) return n.nodeValue.replace(/\u200b/g,'');
     if(n.classList && n.classList.contains('tok')) return '{'+n.getAttribute('data-tok')+'}';
@@ -100,7 +103,7 @@ _HTML = r"""<!doctype html><html><head><meta charset="utf-8">
     var lines=[], buf=null;
     function flush(){ if(buf!==null){ lines.push(buf); buf=null; } }
     Array.prototype.forEach.call(ed.childNodes, function(n){
-      if(n.nodeType===1 && ['DIV','P','H1','H2'].indexOf(n.tagName)>=0){
+      if(n.nodeType===1 && BLOCKS.indexOf(n.tagName)>=0){
         flush();
         var pre = n.tagName==='H1'?'# ': n.tagName==='H2'?'## ':'';
         lines.push(pre+serChildren(n));
@@ -110,6 +113,7 @@ _HTML = r"""<!doctype html><html><head><meta charset="utf-8">
     return lines.join('\n');
   }
 
+  // ---------- разбор markdown -> DOM ----------
   function parseInline(text, parent){
     var re=/(\{\w+\})|(\*\*([^*]+)\*\*)|(\*([^*]+)\*)/g, last=0, m;
     while((m=re.exec(text))!==null){
@@ -124,33 +128,68 @@ _HTML = r"""<!doctype html><html><head><meta charset="utf-8">
   }
   function loadMarkdown(md){
     ed.innerHTML='';
-    var lines=(md||'').split('\n');
-    if(!lines.length) lines=[''];
+    var lines=(md||'').split('\n'); if(!lines.length) lines=[''];
     lines.forEach(function(line){
       var tag='div', txt=line;
       if(/^#\s/.test(line)){ tag='h1'; txt=line.replace(/^#\s/,''); }
       else if(/^##\s/.test(line)){ tag='h2'; txt=line.replace(/^##\s/,''); }
       var el=document.createElement(tag); parseInline(txt, el); ed.appendChild(el);
     });
+    normalizeBlocks();
+  }
+  function normalizeBlocks(){
+    var kids=Array.prototype.slice.call(ed.childNodes), run=null;
+    kids.forEach(function(n){
+      var isBlock = n.nodeType===1 && BLOCKS.indexOf(n.tagName)>=0;
+      if(isBlock){ run=null; }
+      else { if(!run){ run=document.createElement('div'); ed.insertBefore(run,n); } run.appendChild(n); }
+    });
     if(!ed.childNodes.length){ var d=document.createElement('div'); d.appendChild(document.createElement('br')); ed.appendChild(d); }
   }
 
+  // ---------- выделение / блоки ----------
   function selRange(){ var s=window.getSelection(); if(s && s.rangeCount){ var r=s.getRangeAt(0);
     if(ed.contains(r.startContainer)) return r; } return null; }
+  function blockOf(n){ while(n && n!==ed){ if(n.parentNode===ed) return n; n=n.parentNode; } return null; }
+  function currentBlock(){ var r=selRange(); return r?blockOf(r.startContainer):null; }
+  function placeCaretEnd(el){ var r=document.createRange(); r.selectNodeContents(el); r.collapse(false);
+    var s=window.getSelection(); s.removeAllRanges(); s.addRange(r); }
   function placeCaretAfter(node){ var r=document.createRange(); r.setStartAfter(node); r.collapse(true);
     var s=window.getSelection(); s.removeAllRanges(); s.addRange(r); }
-  function insertNodeAtCaret(node){
-    var r=selRange();
-    if(!r){ var last=ed.lastChild || ed; (last===ed?ed:last).appendChild(node); return; }
-    r.deleteContents(); r.insertNode(node);
-  }
+
   function afterEdit(immediate){ updateChips(); if(immediate){ sendValue(); } else { scheduleSend(); } setHeight(); }
 
+  // жирный/курсив — строго в пределах одной строки
+  function fmtInline(cmd){
+    ed.focus(); var r=selRange();
+    if(!r || r.collapsed){ return; }
+    var b1=blockOf(r.startContainer), b2=blockOf(r.endContainer);
+    if(b1 && b1!==b2){ r.setEnd(b1, b1.childNodes.length);
+      var s=window.getSelection(); s.removeAllRanges(); s.addRange(r); }
+    try{ document.execCommand(cmd, false, null); }catch(e){}
+    normalizeBlocks(); afterEdit(false);
+  }
+  // заголовок — вручную меняем тег блока, содержимое сохраняем
+  function setBlock(tag){
+    ed.focus(); var blk=currentBlock(); if(!blk) return;
+    var cur=blk.tagName.toLowerCase(); var to=(cur===tag)?'div':tag;
+    var nv=document.createElement(to);
+    while(blk.firstChild) nv.appendChild(blk.firstChild);
+    if(!nv.childNodes.length) nv.appendChild(document.createElement('br'));
+    blk.parentNode.replaceChild(nv, blk);
+    placeCaretEnd(nv); afterEdit(false);
+  }
+
+  function insertNodeAtCaret(node){
+    var r=selRange();
+    if(!r){ (ed.lastChild||ed).appendChild ? (ed.lastChild||ed).appendChild(node) : ed.appendChild(node); return; }
+    r.deleteContents(); r.insertNode(node);
+  }
   function insertToken(tok){
     ed.focus(); var chip=makeChip(tok); insertNodeAtCaret(chip);
     var sp=document.createTextNode('\u200b');
     chip.parentNode.insertBefore(sp, chip.nextSibling); placeCaretAfter(sp);
-    afterEdit(false);
+    normalizeBlocks(); afterEdit(false);
   }
   function deleteToken(tok){
     Array.prototype.slice.call(ed.querySelectorAll('.tok[data-tok="'+tok+'"]')).forEach(function(n){n.remove();});
@@ -161,25 +200,23 @@ _HTML = r"""<!doctype html><html><head><meta charset="utf-8">
     pendingCmd={id:String(Date.now())+Math.random(), action:'req', token:tok, value:val}; sendValue();
   }
 
-  function currentBlock(){ var r=selRange(); if(!r) return null; var n=r.startContainer;
-    while(n && n!==ed){ if(n.parentNode===ed) return n; n=n.parentNode; } return null; }
-  function setBlock(tag){ ed.focus(); var blk=currentBlock();
-    var cur=blk?blk.tagName.toLowerCase():''; var to=(cur===tag)?'div':tag;
-    try{ document.execCommand('formatBlock', false, '<'+to+'>'); }catch(e){}
-    afterEdit(false); }
-
+  // ---------- кнопки тулбара ----------
   var btns=document.querySelectorAll('.tb button');
   for(var i=0;i<btns.length;i++){(function(b){
     b.addEventListener('mousedown', function(e){ e.preventDefault(); });
-    b.onclick=function(){ ed.focus();
-      if(b.getAttribute('data-c')){ try{document.execCommand(b.getAttribute('data-c'),false,null);}catch(e){} afterEdit(false); }
-      else { setBlock(b.getAttribute('data-b')); } };
+    b.onclick=function(){ if(b.getAttribute('data-c')) fmtInline(b.getAttribute('data-c'));
+      else setBlock(b.getAttribute('data-b')); };
   })(btns[i]);}
 
+  // вставка только как обычный текст (чтобы не ломать структуру)
+  ed.addEventListener('paste', function(e){ e.preventDefault();
+    var t=((e.clipboardData||window.clipboardData).getData('text/plain'))||'';
+    try{ document.execCommand('insertText', false, t); }catch(err){} });
   ed.addEventListener('input', function(){ updateChips(); scheduleSend(); setHeight(); });
   ed.addEventListener('blur', sendValue);
   vsearch.addEventListener('input', filterChips);
 
+  // ---------- правая панель ----------
   function filterChips(){ var q=(vsearch.value||'').toLowerCase();
     document.querySelectorAll('#chips .chip').forEach(function(n){
       var t=(n.getAttribute('data-tok')||'')+' '+(n.getAttribute('data-lbl')||'');
@@ -192,7 +229,6 @@ _HTML = r"""<!doctype html><html><head><meta charset="utf-8">
     var del=n.querySelector('.del'); if(del) del.style.display=active?'':'none';
     var box=n.querySelector('.reqbox'); if(box){ box.disabled=!active; if(!active) box.checked=false; }
   }); setHeight(); }
-
   function renderChips(vars){ allVars=vars||[]; var c=document.getElementById('chips'); c.innerHTML='';
     if(!allVars.length){ c.innerHTML='<div class="empty">Переменных пока нет. Создай их ниже.</div>'; setHeight(); return; }
     allVars.forEach(function(v){ var tok=v[0], lbl=v[1]||'', ty=v[2]||'', req=!!v[3];
@@ -224,11 +260,11 @@ _HTML = r"""<!doctype html><html><head><meta charset="utf-8">
   setHeight();
 </script></body></html>"""
 
-_DIR = tempfile.mkdtemp(prefix="go_editor7_")
+_DIR = tempfile.mkdtemp(prefix="go_editor8_")
 with open(os.path.join(_DIR, "index.html"), "w", encoding="utf-8") as _f:
     _f.write(_HTML)
 
-_component = components.declare_component("go_template_editor_v7", path=_DIR)
+_component = components.declare_component("go_template_editor_v8", path=_DIR)
 
 
 def template_editor(text: str, variables, key=None):
