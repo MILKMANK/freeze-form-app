@@ -644,9 +644,29 @@ if not check_password():
 if "data" not in st.session_state:
     st.session_state.data = load_data()
 for k, v in [("type", "freeze"), ("section", "create"), ("step", 1), ("editor_nonce", 0),
-             ("last_cmd_id", None), ("pending_del_var", None)]:
+             ("last_cmd_id", None), ("pending_del_var", None),
+             ("admin_ok", False), ("admin_pending", None)]:
     if k not in st.session_state:
         st.session_state[k] = v
+
+
+def _edit_pw():
+    try:
+        return st.secrets.get("edit_password", None)
+    except Exception:
+        return None
+
+
+def admin_unlocked():
+    return (_edit_pw() is None) or st.session_state.get("admin_ok", False)
+
+
+def request_admin(action, key=None):
+    """Если разблокировано — вернёт True (действие выполнять сразу). Иначе запросит пароль."""
+    if admin_unlocked():
+        return True
+    st.session_state.admin_pending = {"act": action, "key": key}
+    st.rerun()
 
 
 def goto(tk, section):
@@ -791,7 +811,7 @@ def duplicate_type(src):
 with st.sidebar:
     st.markdown("### Документы")
     q = st.text_input("🔎 Поиск типа", key="type_search", placeholder="название типа…").strip().lower()
-    subs = [("create", "создать документ"), ("template", "шаблон"), ("created", "созданные документы")]
+    subs = [("create", "создать документ"), ("created", "созданные документы")]
     shown = [t for t in all_types() if not q or q in t["name"].lower()]
     if not shown and q:
         st.caption("Ничего не найдено.")
@@ -802,25 +822,32 @@ with st.sidebar:
                 if st.button(("• " if active else "") + sl, key=f"nav_{t['key']}_{sk}",
                              use_container_width=True):
                     goto(t["key"], sk); st.rerun()
-            d1, d2 = st.columns(2)
-            if d1.button("📑 Дублировать", key=f"dup_{t['key']}", use_container_width=True):
-                nk = duplicate_type(t); save_data(); goto(nk, "template"); st.rerun()
-            if d2.button("🗑 В архив", key=f"arch_{t['key']}", use_container_width=True):
-                archive_type(t["key"])
-                rem = [x["key"] for x in all_types()]
-                if st.session_state.type == t["key"]:
-                    st.session_state.type = rem[0] if rem else None
-                save_data(); st.rerun()
+            lk = "" if admin_unlocked() else " 🔒"
+            i1, i2, i3 = st.columns([2, 1, 1])
+            if i1.button("✏️ шаблон" + lk, key=f"nav_{t['key']}_template", use_container_width=True):
+                if request_admin("template", t["key"]):
+                    goto(t["key"], "template"); st.rerun()
+            if i2.button("📑", key=f"dup_{t['key']}", help="Дублировать", use_container_width=True):
+                if request_admin("dup", t["key"]):
+                    nk = duplicate_type(t); save_data(); goto(nk, "template"); st.rerun()
+            if i3.button("🗄", key=f"arch_{t['key']}", help="В архив", use_container_width=True):
+                if request_admin("arch", t["key"]):
+                    archive_type(t["key"])
+                    rem = [x["key"] for x in all_types()]
+                    if st.session_state.type == t["key"]:
+                        st.session_state.type = rem[0] if rem else None
+                    save_data(); st.rerun()
     st.divider()
-    if st.button("➕ Создать новый тип", use_container_width=True):
-        n = len(D()["custom_types"]) + 1
-        key = f"custom{n}"
-        while any(c["key"] == key for c in D()["custom_types"]):
-            n += 1; key = f"custom{n}"
-        D()["custom_types"].append({"key": key, "name": f"Новый тип документа {n}", "var_tokens": ["name"]})
-        D()["texts"][key] = "# НОВЫЙ ДОКУМЕНТ\n\nClient: {name}\n\n(добавь поля и текст ниже)"
-        D().setdefault("type_created", {})[key] = date.today().isoformat()
-        save_data(); goto(key, "template"); st.rerun()
+    if st.button("➕ Создать новый тип" + ("" if admin_unlocked() else " 🔒"), use_container_width=True):
+        if request_admin("newtype", None):
+            n = len(D()["custom_types"]) + 1
+            key = f"custom{n}"
+            while any(c["key"] == key for c in D()["custom_types"]):
+                n += 1; key = f"custom{n}"
+            D()["custom_types"].append({"key": key, "name": f"Новый тип документа {n}", "var_tokens": ["name"]})
+            D()["texts"][key] = "# НОВЫЙ ДОКУМЕНТ\n\nClient: {name}\n\n(добавь поля и текст ниже)"
+            D().setdefault("type_created", {})[key] = date.today().isoformat()
+            save_data(); goto(key, "template"); st.rerun()
 
     arch = D().get("archived", {})
     if arch:
@@ -831,10 +858,22 @@ with st.sidebar:
                 deleted = fmt_iso(arch[key])
                 st.markdown(f"**{type_name(key)}**  \n<span style='font-size:11px;color:gray'>"
                             f"создан: {created} · удалён: {deleted}</span>", unsafe_allow_html=True)
-                if st.button("↩️ Восстановить", key=f"restore_{key}", use_container_width=True):
-                    restore_type(key); save_data(); goto(key, "create"); st.rerun()
+                if st.button("↩️ Восстановить" + ("" if admin_unlocked() else " 🔒"),
+                             key=f"restore_{key}", use_container_width=True):
+                    if request_admin("restore", key):
+                        restore_type(key); save_data(); goto(key, "create"); st.rerun()
 
     st.divider()
+    if _edit_pw() is not None:
+        if st.session_state.get("admin_ok"):
+            st.caption("🔓 Редактирование разблокировано")
+            if st.button("Заблокировать редактирование", use_container_width=True):
+                st.session_state.admin_ok = False
+                if st.session_state.section == "template":
+                    goto(st.session_state.type, "create")
+                st.rerun()
+        else:
+            st.caption("🔒 Редактирование защищено паролем")
     src = st.session_state.get("storage_src", "local")
     label = {"gsheets": "🟢 Google-таблица", "local": "🟡 локально (сбросится при перезапуске)",
              "empty": "🟡 локально"}.get(src, src)
@@ -852,6 +891,53 @@ if t is None:
 
 if sync_type_with_text(t):
     save_data(); st.rerun()
+
+# ---------------- админ-гейт (редактирование) ----------------
+_pend = st.session_state.get("admin_pending")
+if _pend and not admin_unlocked():
+    st.title("🔒 Режим редактирования")
+    st.caption("Изменение шаблонов, переменных и типов документов защищено паролем администратора. "
+               "Создавать документы можно без пароля.")
+    pwv = st.text_input("Пароль редактирования", type="password", key="adm_pw_input")
+    g1, g2 = st.columns([1, 3])
+    if g1.button("Войти", type="primary"):
+        if pwv == _edit_pw():
+            st.session_state.admin_ok = True; st.rerun()
+        else:
+            st.error("Неверный пароль.")
+    if g2.button("Отмена"):
+        st.session_state.admin_pending = None
+        goto(st.session_state.type, "create"); st.rerun()
+    st.stop()
+if _pend and admin_unlocked():
+    _act = _pend.get("act"); _key = _pend.get("key")
+    st.session_state.admin_pending = None
+    if _act == "template":
+        goto(_key, "template")
+    elif _act == "dup":
+        src = get_type(_key)
+        if src:
+            nk = duplicate_type(src); save_data(); goto(nk, "template")
+    elif _act == "arch":
+        archive_type(_key)
+        rem = [x["key"] for x in all_types()]
+        if st.session_state.type == _key:
+            st.session_state.type = rem[0] if rem else None
+        save_data()
+    elif _act == "newtype":
+        n = len(D()["custom_types"]) + 1; nkey = f"custom{n}"
+        while any(c["key"] == nkey for c in D()["custom_types"]):
+            n += 1; nkey = f"custom{n}"
+        D()["custom_types"].append({"key": nkey, "name": f"Новый тип документа {n}", "var_tokens": ["name"]})
+        D()["texts"][nkey] = "# НОВЫЙ ДОКУМЕНТ\n\nClient: {name}\n\n(добавь поля и текст ниже)"
+        D().setdefault("type_created", {})[nkey] = date.today().isoformat()
+        save_data(); goto(nkey, "template")
+    elif _act == "restore":
+        restore_type(_key); save_data(); goto(_key, "create")
+    st.rerun()
+
+if sec == "template" and not admin_unlocked():
+    request_admin("template", t["key"])
 
 # ===== СОЗДАТЬ =====
 if sec == "create":
