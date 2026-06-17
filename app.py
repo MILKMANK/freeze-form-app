@@ -114,7 +114,8 @@ def all_types():
     for ct in D()["custom_types"]:
         if ct["key"] in arch:
             continue
-        out.append({"key": ct["key"], "name": ct["name"], "builtin": False, "kind": "custom",
+        out.append({"key": ct["key"], "name": ct["name"], "builtin": False,
+                    "kind": ct.get("kind", "custom"),
                     "var_tokens": ct.get("var_tokens", [])})
     return out
 
@@ -182,8 +183,12 @@ def all_tokens(t):
     return seen
 
 
+def _uses_base_form(t):
+    return t["kind"] in ("freeze", "extension")
+
+
 def add_token_to_type(t, tok):
-    if t["builtin"]:
+    if _uses_base_form(t):
         lst = D().setdefault("extra_tokens", {}).setdefault(t["key"], [])
         if tok not in lst and tok not in base_tokens(t):
             lst.append(tok)
@@ -195,8 +200,8 @@ def add_token_to_type(t, tok):
 
 
 def remove_token_from_type(t, tok):
-    """Убирает переменную из набора документа (базовые встроенные не трогаем)."""
-    if t["builtin"]:
+    """Убирает переменную из набора документа (базовые поля форм не трогаем)."""
+    if _uses_base_form(t):
         lst = D().setdefault("extra_tokens", {}).get(t["key"], [])
         if tok in lst:
             lst.remove(tok)
@@ -509,8 +514,72 @@ def _parse(v):
     return v
 
 
-def repopulate(t, form, extra):
+def _date_from_fmt(s):
+    from datetime import datetime
+    try:
+        return datetime.strptime(str(s), E.DATE_FMT).date().isoformat()
+    except Exception:
+        return None
+
+
+def _num_or(s, default):
+    try:
+        return int(float(str(s)))
+    except Exception:
+        return default
+
+
+def _form_from_ctx(t, ctx):
+    """Восстановить (form, extra) из готовых значений документа (для старых записей)."""
+    ctx = ctx or {}
+    extra = {}
+    for tok in extra_tokens(t):
+        v = var_get(tok)
+        if v["type"] == "calc_date":
+            continue
+        val = ctx.get(tok, "")
+        if v["type"] == "date":
+            extra[tok] = _date_from_fmt(val)
+        elif v["type"] in ("number", "dur_days", "dur_months"):
+            extra[tok] = _num_or(val, 0)
+        else:
+            extra[tok] = val
+    if t["kind"] == "freeze":
+        bd = _num_or(ctx.get("break_days"), 14)
+        form = {"exhibit": ctx.get("exhibit", "A"), "client_name": ctx.get("name", ""),
+                "selected_plan": ctx.get("plan", ""),
+                "start_date": _date_from_fmt(ctx.get("start_date")),
+                "orig_exp": _date_from_fmt(ctx.get("orig_expiration")),
+                "break_start": _date_from_fmt(ctx.get("break_start")),
+                "mode": "days", "break_days": bd, "break_end": None,
+                "reason": "" if ctx.get("reason") in (None, "N/A") else ctx.get("reason", "")}
+        return form, extra
+    if t["kind"] == "extension":
+        form = {"exhibit": ctx.get("exhibit", "A"), "client_name": ctx.get("name", ""),
+                "selected_plan": ctx.get("plan", ""),
+                "start_date": _date_from_fmt(ctx.get("start_date")),
+                "current_exp": _date_from_fmt(ctx.get("current_expiration")),
+                "ext_months": _num_or(ctx.get("extension_months"), 6)}
+        return form, extra
+    form = {}
+    for tok in t["var_tokens"]:
+        v = var_get(tok)
+        if v["type"] == "calc_date":
+            continue
+        val = ctx.get(tok, "")
+        if v["type"] == "date":
+            form[tok] = _date_from_fmt(val)
+        elif v["type"] in ("number", "dur_days", "dur_months"):
+            form[tok] = _num_or(val, 0)
+        else:
+            form[tok] = val
+    return form, {}
+
+
+def repopulate(t, form, extra, ctx=None):
     """Загружает сохранённые данные документа обратно в форму создания."""
+    if not form and ctx:
+        form, extra = _form_from_ctx(t, ctx)
     ns = t["key"] + "_"
     f = form or {}
     ex = extra or {}
@@ -548,9 +617,13 @@ def duplicate_type(src):
     while any(c["key"] == key for c in D()["custom_types"]) or key in BUILTINS:
         n += 1; key = f"custom{n}"
     D()["custom_types"].append({"key": key, "name": type_name(src["key"]) + " (копия)",
-                                "var_tokens": list(all_tokens(src))})
+                                "kind": src["kind"], "var_tokens": list(all_tokens(src))})
     D()["texts"][key] = text_of(src["key"])
     D().setdefault("type_created", {})[key] = date.today().isoformat()
+    # копируем доп. поля (для freeze/extension-копий)
+    src_extra = list(D().get("extra_tokens", {}).get(src["key"], []))
+    if src_extra:
+        D().setdefault("extra_tokens", {})[key] = src_extra
     return key
 
 
@@ -867,7 +940,7 @@ elif sec == "created":
                     except Exception:
                         c[2].caption("PDF —")
                 if c[3].button("✏️ Изменить", key=f"edit_{t['key']}_{i}", use_container_width=True):
-                    repopulate(t, e.get("form", {}), e.get("extra", {}))
+                    repopulate(t, e.get("form", {}), e.get("extra", {}), e.get("ctx", {}))
                     goto(t["key"], "create")
                     st.session_state.step = 1
                     st.rerun()
