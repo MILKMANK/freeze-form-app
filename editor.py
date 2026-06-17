@@ -20,6 +20,7 @@ _HTML = r"""<!doctype html><html><head><meta charset="utf-8">
   .tb button{border:1px solid #c9ccd1;background:#fff;border-radius:6px;padding:4px 10px;
     cursor:pointer;font-size:13px;color:#111;}
   .tb button:hover{background:#f3f4f6;}
+  .hint{font-size:11px;color:#16a34a;margin:0 0 6px;}
   .editor{box-sizing:border-box;width:100%;min-height:380px;border:1px solid #c9ccd1;border-radius:8px;
     padding:12px;font-family:Georgia,"Times New Roman",serif;font-size:14px;line-height:1.6;outline:none;
     white-space:pre-wrap;word-wrap:break-word;color:#1a1a1a;overflow:auto;}
@@ -59,6 +60,7 @@ _HTML = r"""<!doctype html><html><head><meta charset="utf-8">
         <button data-b="h1" title="Заголовок">H1</button>
         <button data-b="h2" title="Подзаголовок">H2</button>
       </div>
+      <div class="hint">Выдели текст и нажми Ж / К / H1 / H2 — символы разметки не показываются (визуальный редактор)</div>
       <div id="ed" class="editor" contenteditable="true" spellcheck="false"></div>
     </div>
     <div class="right">
