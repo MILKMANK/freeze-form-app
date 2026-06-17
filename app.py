@@ -227,33 +227,55 @@ def required_tokens(t):
     return D().setdefault("required", {}).setdefault(t["key"], [])
 
 
-def sync_type_with_text(t):
-    """Переменные, встречающиеся в тексте, становятся полями документа.
-       Вычисляемым датам добавляем их базу и длительность.
-       Обязательность снимается с тех, кого в тексте уже нет."""
-    changed = False
+def needed_tokens(t):
+    """Замыкание переменных, реально нужных для текста: сами токены из текста +
+       всё, от чего зависят формулы / вычисляемые даты / значения по умолчанию."""
     txt = text_of(t["key"]) or ""
-    for v in variables():
-        tok = v["token"]
-        if tok in all_tokens(t):
+    needed = set()
+    frontier = [v["token"] for v in variables() if ("{" + v["token"] + "}") in txt]
+    while frontier:
+        tok = frontier.pop()
+        if tok in needed:
             continue
-        if ("{" + tok + "}") in txt:
-            add_token_to_type(t, tok); changed = True
-    # базе/длительности вычисляемых дат и переменным формул нужны свои поля
-    for tok in list(all_tokens(t)):
+        needed.add(tok)
         v = var_get(tok)
+        refs = []
+        if v.get("type") == "formula":
+            refs += E.refs_in(v.get("expr", ""))
         if v.get("type") == "calc_date":
-            for ref in (v.get("base"), v.get("dur")):
-                if ref and ref not in all_tokens(t):
-                    add_token_to_type(t, ref); changed = True
-        elif v.get("type") == "formula":
-            for ref in E.refs_in(v.get("expr", "")):
-                if ref not in all_tokens(t):
-                    add_token_to_type(t, ref); changed = True
+            refs += [v.get("base"), v.get("dur")]
         if v.get("default_expr"):
-            for ref in E.refs_in(v.get("default_expr", "")):
-                if ref not in all_tokens(t):
-                    add_token_to_type(t, ref); changed = True
+            refs += E.refs_in(v.get("default_expr", ""))
+        for r in refs:
+            if r and r not in needed:
+                frontier.append(r)
+    return needed
+
+
+def sync_type_with_text(t):
+    """Поля типа = ровно замыкание переменных, нужных тексту. Лишние (например,
+       оставшиеся после дублирования) убираются. Обязательность чистится по тексту."""
+    changed = False
+    needed = needed_tokens(t)
+    if _uses_base_form(t):
+        base = set(base_tokens(t))
+        new_extra = [tok for tok in needed if tok not in base]
+        cur = D().setdefault("extra_tokens", {}).get(t["key"], [])
+        kept = [tok for tok in cur if tok in needed]
+        for tok in new_extra:
+            if tok not in kept:
+                kept.append(tok)
+        if kept != cur:
+            D()["extra_tokens"][t["key"]] = kept; changed = True
+    else:
+        ct = next(c for c in D()["custom_types"] if c["key"] == t["key"])
+        cur = ct.get("var_tokens", [])
+        kept = [tok for tok in cur if tok in needed]
+        for tok in needed:
+            if tok not in kept:
+                kept.append(tok)
+        if kept != cur:
+            ct["var_tokens"] = kept; changed = True
     req = required_tokens(t)
     pruned = [tok for tok in req if in_text(t, tok)]
     if pruned != req:
@@ -821,7 +843,7 @@ if t is None:
     st.stop()
 
 if sync_type_with_text(t):
-    save_data()
+    save_data(); st.rerun()
 
 # ===== СОЗДАТЬ =====
 if sec == "create":
@@ -1014,6 +1036,62 @@ elif sec == "template":
                 if defx and defx.strip() and ntype in ("date", "number", "dur_days", "dur_months"):
                     nv["default_expr"] = defx.strip()
                 variables().append(nv); save_data(); st.rerun()
+
+    with st.expander("✏️ Редактировать переменную"):
+        evs = list(variables())
+        if not evs:
+            st.caption("Переменных пока нет.")
+        else:
+            elabels = [f"{v['label']}  ·  {{{v['token']}}}  ·  {TYPE_RU.get(v['type'], v['type'])}" for v in evs]
+            esel = st.selectbox("Какую переменную", elabels, key="editsel")
+            ev = evs[elabels.index(esel)]
+            ekey = ev["token"]
+            new_label = st.text_input("Название (метка)", value=ev["label"], key=f"el_{ekey}")
+            st.caption(f"Тип: {TYPE_RU.get(ev['type'], ev['type'])}. "
+                       f"Сам тип сменить нельзя — для этого удали переменную и создай заново.")
+            new_expr = ev.get("expr"); new_out = ev.get("out"); new_def = ev.get("default_expr", "")
+            if ev["type"] == "formula":
+                outs = ["date", "number", "text"]; outl = ["дата", "число", "текст"]
+                noi = st.selectbox("Тип результата", outl,
+                                   index=outs.index(ev.get("out", "number")), key=f"eo_{ekey}")
+                new_out = {"дата": "date", "число": "number", "текст": "text"}[noi]
+                new_expr = st.text_area("Формула", value=ev.get("expr", ""), key=f"ee_{ekey}")
+                if new_expr and new_expr.strip():
+                    try:
+                        tenv = {v["token"]: (float(date.today().toordinal()) if v["type"] in ("date", "calc_date", "formula")
+                                             else 1.0 if v["type"] in ("number", "dur_days", "dur_months") else "текст")
+                                for v in variables()}
+                        E.evaluate_formula(new_expr, tenv)
+                        st.caption("✅ Формула разобрана без ошибок.")
+                    except Exception as ex:
+                        st.warning(f"Проверь формулу: {ex}")
+            elif ev["type"] in ("date", "number", "dur_days", "dur_months"):
+                new_def = st.text_input("Значение по умолчанию — формула (необязательно, поле останется редактируемым)",
+                                        value=ev.get("default_expr", ""), key=f"ed_{ekey}",
+                                        placeholder="напр. EDATE({start_date}; 6)")
+                if new_def and new_def.strip():
+                    try:
+                        tenv = {v["token"]: (float(date.today().toordinal()) if v["type"] in ("date", "calc_date", "formula")
+                                             else 1.0 if v["type"] in ("number", "dur_days", "dur_months") else "текст")
+                                for v in variables()}
+                        E.evaluate_formula(new_def, tenv)
+                        st.caption("✅ Формула по умолчанию разобрана без ошибок.")
+                    except Exception as ex:
+                        st.warning(f"Проверь формулу: {ex}")
+            if st.button("💾 Сохранить изменения", key=f"esave_{ekey}"):
+                ev["label"] = new_label.strip() or ev["token"]
+                if ev["type"] == "formula":
+                    ev["expr"] = (new_expr or "").strip(); ev["out"] = new_out
+                elif ev["type"] in ("date", "number", "dur_days", "dur_months"):
+                    if new_def and new_def.strip():
+                        ev["default_expr"] = new_def.strip()
+                    else:
+                        ev.pop("default_expr", None)
+                # сбросить «тронутость» полей, чтобы новое умолчание применилось
+                for tk in list(st.session_state.keys()):
+                    if tk.endswith(ekey + "_touched"):
+                        st.session_state[tk] = False
+                save_data(); st.success("Сохранено."); st.rerun()
 
     with st.expander("🗑 Удалить переменную совсем (из всех документов)"):
         allv = list(variables())
