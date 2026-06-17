@@ -47,39 +47,303 @@ def add_duration(d: date, n: int, unit: str) -> date:
 DURATION_UNIT = {"dur_days": "days", "dur_months": "months"}
 
 
+# =================== ФОРМУЛЫ (Excel-подобные, без eval) ===================
+class FormulaError(Exception):
+    pass
+
+
+def refs_in(expr: str):
+    """Токены переменных, на которые ссылается формула."""
+    return re.findall(r"\{(\w+)\}", expr or "")
+
+
+_TOKEN_RE = re.compile(r"""\s*(
+    \{\w+\}            |
+    \d+\.?\d*%         |
+    \d+\.?\d*          |
+    "[^"]*"            |
+    >=|<=|<>           |
+    [-+*/(),;<>=&]     |
+    [A-Za-z_][A-Za-z0-9_]*
+)""", re.X)
+
+
+def _tokenize(expr: str):
+    return [m.group(1) for m in _TOKEN_RE.finditer(expr or "")]
+
+
+def _is_num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _to_text(v):
+    if isinstance(v, str):
+        return v
+    f = float(v)
+    return str(int(f)) if f == int(f) else (f"{f:.4f}".rstrip("0").rstrip("."))
+
+
+def _num(v, ctx="число"):
+    if isinstance(v, str):
+        raise FormulaError(f"ожидалось {ctx}, а не текст")
+    return float(v)
+
+
+def _edate_serial(serial, months):
+    d = date.fromordinal(int(round(serial)))
+    return add_months(d, int(round(months))).toordinal()
+
+
+def _call(name, a):
+    n = name
+    def num(i): return _num(a[i])
+    if n == "TODAY":
+        return float(date.today().toordinal())
+    if n == "DATE":
+        return float(date(int(num(0)), int(num(1)), int(num(2))).toordinal())
+    if n == "EDATE":
+        return float(_edate_serial(num(0), num(1)))
+    if n == "ADDDAYS":
+        return num(0) + num(1)
+    if n == "DAYS":
+        return num(0) - num(1)
+    if n in ("YEAR", "MONTH", "DAY"):
+        d = date.fromordinal(int(round(num(0))))
+        return float({"YEAR": d.year, "MONTH": d.month, "DAY": d.day}[n])
+    if n == "ROUND":
+        return float(round(num(0), int(num(1)) if len(a) > 1 else 0))
+    if n == "ROUNDUP":
+        import math
+        k = 10 ** (int(num(1)) if len(a) > 1 else 0)
+        return float(math.ceil(num(0) * k) / k)
+    if n == "ROUNDDOWN":
+        import math
+        k = 10 ** (int(num(1)) if len(a) > 1 else 0)
+        return float(math.floor(num(0) * k) / k)
+    if n == "INT":
+        return float(int(num(0)))
+    if n == "ABS":
+        return abs(num(0))
+    if n == "MIN":
+        return min(_num(x) for x in a)
+    if n == "MAX":
+        return max(_num(x) for x in a)
+    if n == "SUM":
+        return sum(_num(x) for x in a)
+    if n == "IF":
+        return a[1] if _num(a[0]) != 0 else (a[2] if len(a) > 2 else 0.0)
+    if n == "AND":
+        return 1.0 if all(_num(x) != 0 for x in a) else 0.0
+    if n == "OR":
+        return 1.0 if any(_num(x) != 0 for x in a) else 0.0
+    if n == "NOT":
+        return 1.0 if _num(a[0]) == 0 else 0.0
+    if n == "UPPER":
+        return _to_text(a[0]).upper()
+    if n == "LOWER":
+        return _to_text(a[0]).lower()
+    if n == "LEN":
+        return float(len(_to_text(a[0])))
+    if n == "CONCAT":
+        return "".join(_to_text(x) for x in a)
+    if n == "TEXT":
+        return _text_fn(a[0], _to_text(a[1]) if len(a) > 1 else "")
+    raise FormulaError(f"нет функции {name}()")
+
+
+_MONTHS_EN = ["January", "February", "March", "April", "May", "June", "July",
+              "August", "September", "October", "November", "December"]
+
+
+def _text_fn(val, f):
+    if any(c in f for c in "YyMmDd"):
+        d = date.fromordinal(int(round(float(val))))
+        out = f
+        out = out.replace("YYYY", f"{d.year:04d}").replace("MMMM", _MONTHS_EN[d.month - 1])
+        out = out.replace("YY", f"{d.year % 100:02d}")
+        out = out.replace("MM", f"{d.month:02d}").replace("DD", f"{d.day:02d}")
+        return out
+    if "." in f:
+        dec = len(f.split(".")[1])
+        return f"{float(val):.{dec}f}"
+    if f:
+        return str(int(round(float(val))))
+    return _to_text(val)
+
+
+class _Parser:
+    def __init__(self, toks, env):
+        self.t, self.i, self.env = toks, 0, env
+
+    def peek(self):
+        return self.t[self.i] if self.i < len(self.t) else None
+
+    def nxt(self):
+        tk = self.t[self.i]; self.i += 1; return tk
+
+    def expect(self, x):
+        if self.peek() != x:
+            raise FormulaError(f'ожидалось "{x}"')
+        self.i += 1
+
+    def parse(self):
+        v = self.expr()
+        if self.i < len(self.t):
+            raise FormulaError(f"лишнее: {self.peek()}")
+        return v
+
+    def expr(self):
+        a = self.cmp()
+        while self.peek() == "&":
+            self.nxt(); a = _to_text(a) + _to_text(self.cmp())
+        return a
+
+    def cmp(self):
+        a = self.add(); op = self.peek()
+        if op in (">", "<", ">=", "<=", "=", "<>"):
+            self.nxt(); b = self.add()
+            try:
+                res = {">": a > b, "<": a < b, ">=": a >= b, "<=": a <= b,
+                       "=": a == b, "<>": a != b}[op]
+            except TypeError:
+                raise FormulaError("нельзя сравнить текст и число")
+            return 1.0 if res else 0.0
+        return a
+
+    def add(self):
+        a = self.mul()
+        while self.peek() in ("+", "-"):
+            op = self.nxt(); b = self.mul()
+            a = _num(a) + _num(b) if op == "+" else _num(a) - _num(b)
+        return a
+
+    def mul(self):
+        a = self.un()
+        while self.peek() in ("*", "/"):
+            op = self.nxt(); b = self.un()
+            if op == "*":
+                a = _num(a) * _num(b)
+            else:
+                if _num(b) == 0:
+                    raise FormulaError("деление на ноль")
+                a = _num(a) / _num(b)
+        return a
+
+    def un(self):
+        if self.peek() == "-":
+            self.nxt(); return -_num(self.un())
+        return self.prim()
+
+    def prim(self):
+        x = self.peek()
+        if x is None:
+            raise FormulaError("пустое выражение")
+        if x == "(":
+            self.nxt(); e = self.expr(); self.expect(")"); return e
+        if x[0] == "{":
+            self.nxt(); tok = x[1:-1]
+            if tok not in self.env:
+                raise FormulaError(f"нет переменной {{{tok}}}")
+            val = self.env[tok]
+            if val is None:
+                raise FormulaError(f"{{{tok}}} не заполнена")
+            return val
+        if x[0] == '"':
+            self.nxt(); return x[1:-1]
+        if x.endswith("%"):
+            self.nxt(); return float(x[:-1]) / 100.0
+        if x[0].isdigit():
+            self.nxt(); return float(x)
+        if re.match(r"^[A-Za-z_]", x):
+            self.nxt(); self.expect("(")
+            args = []
+            if self.peek() != ")":
+                args.append(self.expr())
+                while self.peek() in (",", ";"):
+                    self.nxt(); args.append(self.expr())
+            self.expect(")")
+            return _call(x.upper(), args)
+        raise FormulaError(f"непонятно: {x}")
+
+
+def evaluate_formula(expr: str, env: dict):
+    return _Parser(_tokenize(expr), env).parse()
+
+
+def _fmt_out(out, val):
+    if out == "date":
+        return fmt(date.fromordinal(int(round(float(val)))))
+    if out == "number":
+        f = float(val)
+        return str(int(f)) if f == int(f) else (f"{f:.2f}".rstrip("0").rstrip("."))
+    return _to_text(val)
+
+
+def resolve_derived(defs: list, env: dict, vtypes: dict) -> dict:
+    """Считает формулы и calc_date в порядке зависимостей. Мутирует env, возвращает ctx."""
+    ctx = {}
+    pending = list(defs)
+    progress = True
+    while pending and progress:
+        progress = False; still = []
+        for v in pending:
+            tok = v["token"]
+            if v["type"] == "calc_date":
+                refs = [r for r in (v.get("base"), v.get("dur")) if r]
+            else:
+                refs = refs_in(v.get("expr", ""))
+            if all(r in env for r in refs):
+                try:
+                    if v["type"] == "calc_date":
+                        base = env.get(v.get("base")); durv = env.get(v.get("dur")) or 0
+                        if base is None:
+                            raise FormulaError("база не заполнена")
+                        unit = DURATION_UNIT.get(vtypes.get(v.get("dur")), "days")
+                        ser = _edate_serial(base, durv) if unit == "months" else base + durv
+                        env[tok] = float(ser); ctx[tok] = fmt(date.fromordinal(int(round(ser))))
+                    else:
+                        val = evaluate_formula(v.get("expr", ""), env)
+                        out = v.get("out", "number")
+                        env[tok] = val
+                        ctx[tok] = _fmt_out(out, val)
+                except FormulaError as e:
+                    env[tok] = None; ctx[tok] = "ошибка: " + str(e)
+                except Exception:
+                    env[tok] = None; ctx[tok] = "ошибка в формуле"
+                progress = True
+            else:
+                still.append(v)
+        pending = still
+    for v in pending:  # циклы / нерешённые ссылки
+        env[v["token"]] = None; ctx[v["token"]] = "—"
+    return ctx
+
+
 def compute_fields(defs: list, form: dict) -> dict:
     """
-    Универсальный расчёт по списку переменных.
-    defs: [{token,label,type, base?, dur?}], type in
-          text|number|date|dur_days|dur_months|calc_date.
-    calc_date: дата = (base: дата) + (dur: длительность с её единицей).
+    Универсальный расчёт. type in
+      text|number|date|dur_days|dur_months|calc_date|formula.
+    Даты в окружении хранятся как серийный номер дня (ordinal).
     """
-    tmap = {v["token"]: v["type"] for v in defs}
-    raw, ctx = {}, {}
+    env, ctx, vtypes, derived = {}, {}, {}, []
     for v in defs:
         tok, tp = v["token"], v["type"]
+        vtypes[tok] = tp
         if tp == "date":
-            val = form.get(tok); raw[tok] = val
+            val = form.get(tok)
+            env[tok] = val.toordinal() if val else None
             ctx[tok] = fmt(val) if val else "—"
         elif tp in ("number", "dur_days", "dur_months"):
             val = form.get(tok)
             n = 0 if val in (None, "") else int(val)
-            raw[tok] = n; ctx[tok] = str(n)
+            env[tok] = float(n); ctx[tok] = str(n)
         elif tp == "text":
-            val = form.get(tok); raw[tok] = val
-            ctx[tok] = "" if val in (None, "") else str(val)
-    for v in defs:
-        if v["type"] == "calc_date":
-            base = raw.get(v.get("base"))
-            durtok = v.get("dur")
-            dur = raw.get(durtok)
-            unit = DURATION_UNIT.get(tmap.get(durtok), "days")
-            if base:
-                d = add_duration(base, int(dur or 0), unit)
-                raw[v["token"]] = d; ctx[v["token"]] = fmt(d)
-            else:
-                ctx[v["token"]] = "—"
-    return {"err": None, "ctx": ctx, "raw": raw}
+            val = form.get(tok)
+            env[tok] = "" if val in (None, "") else str(val); ctx[tok] = env[tok]
+        elif tp in ("formula", "calc_date"):
+            derived.append(v)
+    ctx.update(resolve_derived(derived, env, vtypes))
+    return {"err": None, "ctx": ctx, "raw": env}
 
 
 # обратная совместимость

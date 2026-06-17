@@ -163,7 +163,8 @@ def fields_of(t):
     for tok in t["var_tokens"]:
         v = var_get(tok)
         out.append({"key": tok, "token": tok, "label": v["label"], "type": v["type"],
-                    "base": v.get("base"), "dur": v.get("dur")})
+                    "base": v.get("base"), "dur": v.get("dur"),
+                    "expr": v.get("expr"), "out": v.get("out")})
     return out
 
 
@@ -213,7 +214,7 @@ def remove_token_from_type(t, tok):
 
 TYPE_RU = {"text": "текст", "date": "дата", "number": "число",
            "dur_days": "длительность (дни)", "dur_months": "длительность (мес.)",
-           "calc_date": "вычисляемая дата"}
+           "calc_date": "вычисляемая дата", "formula": "формула"}
 
 
 def in_text(t, tok):
@@ -236,12 +237,16 @@ def sync_type_with_text(t):
             continue
         if ("{" + tok + "}") in txt:
             add_token_to_type(t, tok); changed = True
-    # базе/длительности вычисляемых дат нужны свои поля
+    # базе/длительности вычисляемых дат и переменным формул нужны свои поля
     for tok in list(all_tokens(t)):
         v = var_get(tok)
         if v.get("type") == "calc_date":
             for ref in (v.get("base"), v.get("dur")):
                 if ref and ref not in all_tokens(t):
+                    add_token_to_type(t, ref); changed = True
+        elif v.get("type") == "formula":
+            for ref in E.refs_in(v.get("expr", "")):
+                if ref not in all_tokens(t):
                     add_token_to_type(t, ref); changed = True
     req = required_tokens(t)
     pruned = [tok for tok in req if in_text(t, tok)]
@@ -334,13 +339,13 @@ def linked_expiration(ns, start_key, label):
 def _render_extra(t, ns):
     extra = {}
     toks = [tk for tk in extra_tokens(t)]
-    shown = [tk for tk in toks if var_get(tk)["type"] != "calc_date"]
+    shown = [tk for tk in toks if var_get(tk)["type"] not in ("calc_date", "formula")]
     if shown:
         st.markdown("**Дополнительные поля**")
     for tok in toks:
         v = var_get(tok)
         tp = v["type"]
-        if tp == "calc_date":
+        if tp in ("calc_date", "formula"):
             continue  # вычисляется автоматически
         key = ns + "x_" + tok
         if tp == "date":
@@ -404,12 +409,12 @@ def render_form(t):
     else:
         form = {}
         flds = fields_of(t)
-        inputs = [f for f in flds if f["type"] != "calc_date"]
+        inputs = [f for f in flds if f["type"] not in ("calc_date", "formula")]
         if not inputs:
             st.info("У этого типа пока нет полей для ввода. Добавь их в разделе «шаблон».")
         for f in flds:
             tp = f["type"]
-            if tp == "calc_date":
+            if tp in ("calc_date", "formula"):
                 continue
             key = ns + f["key"]
             if tp == "date":
@@ -429,28 +434,32 @@ def compute_full(t, form, extra):
     if r["err"]:
         return r
     ctx = dict(r["ctx"]); raw = dict(r.get("raw", {}))
-    for tok, val in (extra or {}).items():
-        vt = var_get(tok)["type"]
-        if vt == "date":
-            raw[tok] = val
-            ctx[tok] = E.fmt(val) if val else "—"
-        elif vt in ("number", "dur_days", "dur_months"):
-            n = 0 if val in (None, "") else int(val)
-            raw[tok] = n; ctx[tok] = str(n)
+    env = {}; vtypes = {}
+    for tok, val in raw.items():  # встроенные базовые значения -> серийные даты/числа
+        vtypes[tok] = var_get(tok)["type"]
+        if isinstance(val, date):
+            env[tok] = float(val.toordinal())
+        elif isinstance(val, bool):
+            env[tok] = float(val)
+        elif isinstance(val, (int, float)):
+            env[tok] = float(val)
         else:
-            raw[tok] = val
-            ctx[tok] = "" if val in (None, "") else str(val)
+            env[tok] = val
+    derived = []
     for tok in extra_tokens(t):
-        v = var_get(tok)
-        if v["type"] == "calc_date":
-            base = raw.get(v.get("base")); durtok = v.get("dur")
-            dur = raw.get(durtok)
-            unit = E.DURATION_UNIT.get(var_get(durtok)["type"], "days") if durtok else "days"
-            if base:
-                d = E.add_duration(base, int(dur or 0), unit)
-                raw[tok] = d; ctx[tok] = E.fmt(d)
-            else:
-                ctx[tok] = "—"
+        v = var_get(tok); vtypes[tok] = v["type"]
+        if v["type"] in ("formula", "calc_date"):
+            derived.append(v); continue
+        val = extra.get(tok)
+        if v["type"] == "date":
+            env[tok] = val.toordinal() if val else None
+            ctx[tok] = E.fmt(val) if val else "—"
+        elif v["type"] in ("number", "dur_days", "dur_months"):
+            n = 0 if val in (None, "") else int(val)
+            env[tok] = float(n); ctx[tok] = str(n)
+        else:
+            env[tok] = "" if val in (None, "") else str(val); ctx[tok] = env[tok]
+    ctx.update(E.resolve_derived(derived, env, vtypes))
     return {"err": None, "ctx": ctx}
 
 
@@ -775,7 +784,7 @@ if sec == "create":
             for tok in required_tokens(t):
                 v = var_get(tok)
                 ty = v["type"]
-                if ty in ("date", "calc_date"):
+                if ty in ("date", "calc_date", "formula"):
                     continue
                 if tok in extra:
                     val = extra.get(tok)
@@ -874,18 +883,41 @@ elif sec == "template":
         st.caption("Создай переменную — затем кликни её в списке справа, чтобы вставить в текст.")
         type_labels = [("text", "текст"), ("date", "дата"), ("number", "число"),
                        ("dur_days", "длительность (дни)"), ("dur_months", "длительность (месяцы)"),
+                       ("formula", "формула (Excel-подобная)"),
                        ("calc_date", "вычисляемая дата (дата + длительность)")]
         nl = st.text_input("Название (метка)", key=f"nl_{t['key']}")
         ntok = st.text_input("Токен (латиницей, без пробелов)", key=f"nt_{t['key']}")
         ntype_label = st.selectbox("Тип", [l for _, l in type_labels], key=f"nty_{t['key']}")
         ntype = dict((l, v) for v, l in type_labels)[ntype_label]
         base = dur = None
-        if ntype == "calc_date":
+        fexpr = fout = None
+        if ntype == "formula":
+            fout_label = st.selectbox("Тип результата", ["дата", "число", "текст"], key=f"fo_{t['key']}")
+            fout = {"дата": "date", "число": "number", "текст": "text"}[fout_label]
+            fexpr = st.text_area("Формула", key=f"fe_{t['key']}",
+                                 placeholder="напр. EDATE({current_expiration}; {extension_months})")
+            with st.popover("Переменные и функции"):
+                st.caption("Доступные переменные (копируй в формулу):")
+                st.code("  ".join("{" + v["token"] + "}" for v in variables()) or "—")
+                st.caption("Функции: EDATE(дата; мес.), TODAY(), DATE(г;м;д), DAYS(кон;нач), "
+                           "ADDDAYS(дата;дни), YEAR/MONTH/DAY(дата), ROUND/ROUNDUP/ROUNDDOWN(x;знаки), "
+                           "INT, ABS, MIN, MAX, SUM, IF(усл;да;нет), AND/OR/NOT, "
+                           "UPPER/LOWER/LEN/CONCAT, TEXT(знач;\"DD.MM.YYYY\"), & — склейка, % — процент. "
+                           "Даты: дата+дни=дата, дата−дата=дни.")
+            if fexpr and fexpr.strip():
+                try:
+                    test_env = {v["token"]: (float(date.today().toordinal()) if v["type"] in ("date", "calc_date", "formula")
+                                             else 1.0 if v["type"] in ("number", "dur_days", "dur_months")
+                                             else "текст") for v in variables()}
+                    E.evaluate_formula(fexpr, test_env)
+                    st.caption("✅ Формула разобрана без ошибок.")
+                except Exception as ex:
+                    st.warning(f"Проверь формулу: {ex}")
+        elif ntype == "calc_date":
             date_toks = [v["token"] for v in variables() if v["type"] == "date"]
             dur_toks = [v["token"] for v in variables() if v["type"] in ("dur_days", "dur_months")]
             if not date_toks or not dur_toks:
-                st.info("Сначала создай переменную-дату и переменную-длительность, "
-                        "потом — вычисляемую дату.")
+                st.info("Сначала создай переменную-дату и переменную-длительность, потом — вычисляемую дату.")
             else:
                 base = st.selectbox("База (дата)", date_toks,
                     format_func=lambda x: f"{var_get(x)['label']}  ·  {{{x}}}", key=f"cb_{t['key']}")
@@ -899,10 +931,14 @@ elif sec == "template":
                 st.error("Такой токен уже есть.")
             elif ntype == "calc_date" and not (base and dur):
                 st.error("Для вычисляемой даты нужны переменная-дата и переменная-длительность.")
+            elif ntype == "formula" and not (fexpr and fexpr.strip()):
+                st.error("Введи формулу.")
             else:
                 nv = {"token": tok, "label": nl or tok, "type": ntype}
                 if ntype == "calc_date":
                     nv["base"] = base; nv["dur"] = dur
+                elif ntype == "formula":
+                    nv["expr"] = fexpr.strip(); nv["out"] = fout
                 variables().append(nv); save_data(); st.rerun()
 
     with st.expander("🗑 Удалить переменную совсем (из всех документов)"):
