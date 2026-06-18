@@ -47,7 +47,8 @@ BUILTIN_ORDER = ["freeze", "extension"]
 # ---------------- хранилище ----------------
 def load_data():
     d = {"texts": {}, "custom_types": [], "saved": {}, "variables": [], "extra_tokens": {},
-         "type_created": {}, "archived": {}, "required": {}, "deleted_defaults": [], "sig_table": {}}
+         "type_created": {}, "archived": {}, "required": {}, "deleted_defaults": [], "sig_table": {},
+         "filename": {}}
     loaded, src = storage.load(DATA_FILE)
     st.session_state["storage_src"] = src
     if loaded:
@@ -159,6 +160,34 @@ def sig_enabled(t):
 
 def set_sig(t, val):
     D().setdefault("sig_table", {})[t["key"]] = bool(val)
+
+
+DEFAULT_FNAME = "{client}_{type}"
+
+
+def filename_template(t):
+    return D().setdefault("filename", {}).get(t["key"], DEFAULT_FNAME)
+
+
+def set_filename_template(t, val):
+    D().setdefault("filename", {})[t["key"]] = val
+
+
+def build_filename(t, ctx, client):
+    tpl = filename_template(t) or DEFAULT_FNAME
+    data = {k: ("" if v is None else str(v)) for k, v in (ctx or {}).items()}
+    data["client"] = client or data.get("name", "") or "—"
+    data["type"] = t["name"]
+    data["type_key"] = t["key"]
+    data["date"] = date.today().strftime("%Y-%m-%d")
+    out = tpl
+    for k, v in data.items():
+        out = out.replace("{" + k + "}", v)
+    # убрать незаполненные {что-то}
+    while "{" in out and "}" in out:
+        i = out.index("{"); j = out.index("}", i)
+        out = out[:i] + out[j + 1:]
+    return E.safe_name(out.strip()) or "document"
 
 
 def get_type(tk):
@@ -1155,7 +1184,7 @@ if sec == "create":
                     unsafe_allow_html=True)
         st.write("")
         docx_bytes = E.build_docx(text_of(t["key"]), ctx, client, with_signature=sig)
-        fname = f"{E.safe_name(client)}_{t['key']}"
+        fname = build_filename(t, ctx, client)
         b1, b2, b3, b4 = st.columns(4)
         with b1:
             if st.button("← Назад", use_container_width=True):
@@ -1215,6 +1244,14 @@ elif sec == "template":
         ct = next(c for c in D()["custom_types"] if c["key"] == t["key"])
         ct["name"] = st.text_input("Название типа документа", ct["name"])
 
+    cur_fn = filename_template(t)
+    new_fn = st.text_input("Шаблон имени файла", value=cur_fn, key=f"fn_{t['key']}",
+                           placeholder=DEFAULT_FNAME)
+    if new_fn != cur_fn:
+        set_filename_template(t, new_fn); save_data()
+    avail = ", ".join("{" + tok + "}" for tok in (["client", "date", "type"] +
+                      [v["token"] for v in variables() if in_text(t, v["token"])]))
+    st.caption(f"Доступно: {avail}. Пример: {build_filename(t, {}, 'Иван Иванов')}.docx")
     cur_sig = sig_enabled(t)
     new_sig = st.checkbox("Добавлять таблицу подписей в конце документа", value=cur_sig,
                           key=f"sig_{t['key']}")
@@ -1465,7 +1502,7 @@ elif sec == "created":
                 client = e["ctx"].get("name", e.get("client", ""))
                 esig = e.get("sig", sig_enabled(t))
                 docx_bytes = E.build_docx(e["text"], e["ctx"], client, with_signature=esig)
-                fname = f"{E.safe_name(e['client'])}_{t['key']}"
+                fname = build_filename(t, e["ctx"], client)
                 c[1].download_button("⬇️ .docx", docx_bytes, file_name=fname + ".docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                     key=f"dl_{t['key']}_{i}", use_container_width=True)
