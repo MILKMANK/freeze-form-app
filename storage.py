@@ -20,6 +20,63 @@ def gsheets_configured() -> bool:
         return False
 
 
+def gdrive_configured() -> bool:
+    try:
+        return ("gcp_service_account" in st.secrets and "gdrive" in st.secrets
+                and bool(st.secrets["gdrive"].get("folder")))
+    except Exception:
+        return False
+
+
+def check_gsheets():
+    """(ok, сообщение) — пытается реально открыть таблицу и прочитать лист."""
+    if not gsheets_configured():
+        return False, "В Secrets нет [gcp_service_account] или [gsheets]."
+    try:
+        ws = _worksheet()
+        ws.col_values(1)
+        return True, "Таблица открыта, чтение/запись доступны."
+    except Exception as e:
+        return False, str(e)
+
+
+def check_gdrive():
+    """(ok, сообщение) — проверяет доступ к папке Google Drive."""
+    if not gdrive_configured():
+        return False, "В Secrets нет [gdrive].folder."
+    try:
+        from google.oauth2.service_account import Credentials
+        from googleapiclient.discovery import build
+        info = dict(st.secrets["gcp_service_account"])
+        creds = Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/drive"])
+        svc = build("drive", "v3", credentials=creds, cache_discovery=False)
+        folder = st.secrets["gdrive"]["folder"]
+        meta = svc.files().get(fileId=folder, fields="id,name",
+                               supportsAllDrives=True).execute()
+        return True, f"Папка доступна: {meta.get('name')}"
+    except Exception as e:
+        return False, str(e)
+
+
+def upload_to_drive(filename: str, data: bytes, mime: str):
+    """Загружает файл в папку Google Drive (folder из secrets). Возвращает ссылку или None."""
+    import io
+    from google.oauth2.service_account import Credentials
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseUpload
+    info = dict(st.secrets["gcp_service_account"])
+    creds = Credentials.from_service_account_info(
+        info, scopes=["https://www.googleapis.com/auth/drive"])
+    svc = build("drive", "v3", credentials=creds, cache_discovery=False)
+    folder = st.secrets["gdrive"]["folder"]
+    meta = {"name": filename, "parents": [folder]}
+    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=False)
+    f = svc.files().create(body=meta, media_body=media, fields="id,webViewLink",
+                           supportsAllDrives=True).execute()
+    return f.get("webViewLink")
+
+
 def _worksheet():
     import gspread
     from google.oauth2.service_account import Credentials

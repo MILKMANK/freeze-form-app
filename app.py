@@ -5,6 +5,7 @@ Go Offer Docs — генератор документов по шаблонам.
 import json, string
 from datetime import date
 from pathlib import Path
+from urllib.parse import quote
 
 import streamlit as st
 import engine as E
@@ -669,6 +670,135 @@ def request_admin(action, key=None):
     st.rerun()
 
 
+def _slug(s):
+    return "".join(ch if ch.isalnum() else "_" for ch in str(s).lower())
+
+
+APP_URL = "https://freeze-form-app.streamlit.app/"
+
+
+def prefill_tokens(t):
+    """Входные переменные типа (которые можно передать в ссылке)."""
+    if t["kind"] == "freeze":
+        base = ["name", "plan", "exhibit", "start_date", "orig_expiration",
+                "break_start", "break_end", "break_days", "reason"]
+    elif t["kind"] == "extension":
+        base = ["name", "plan", "exhibit", "start_date", "current_expiration", "extension_months"]
+    else:
+        base = []
+    toks = list(base)
+    src = extra_tokens(t) if _uses_base_form(t) else t["var_tokens"]
+    for tok in src:
+        if var_get(tok)["type"] not in ("formula", "calc_date") and tok not in toks:
+            toks.append(tok)
+    return toks
+
+
+def prefill_link(t):
+    parts = ["type=" + t["key"]]
+    for tok in prefill_tokens(t):
+        parts.append(tok + "=" + var_get(tok)["label"])
+    return APP_URL + "?" + "&".join(parts)
+
+
+def resolve_type_key(v):
+    v = (v or "").strip()
+    vs = _slug(v)
+    for t in all_types():
+        if t["key"].lower() == v.lower():
+            return t["key"]
+    for t in all_types():
+        if _slug(t["name"]) == vs:
+            return t["key"]
+    for t in all_types():
+        ns = _slug(t["name"])
+        if vs and (vs in ns or ns in vs):
+            return t["key"]
+    return None
+
+
+def _conv_param(val, vtype):
+    s = str(val)
+    if vtype == "date":
+        from datetime import datetime
+        for f in ("%Y-%m-%d", "%d.%m.%Y", "%m/%d/%Y", "%Y/%m/%d"):
+            try:
+                return datetime.strptime(s, f).date()
+            except Exception:
+                pass
+        return None
+    if vtype in ("number", "dur_days", "dur_months"):
+        try:
+            return int(float(s))
+        except Exception:
+            return None
+    return s
+
+
+_TYPE_PARAMS = ("type", "form", "doc", "документ")
+
+
+def apply_prefill():
+    if st.session_state.get("_prefilled"):
+        return
+    try:
+        params = st.query_params
+        keys = list(params.keys())
+    except Exception:
+        st.session_state["_prefilled"] = True
+        return
+    if not keys:
+        st.session_state["_prefilled"] = True
+        return
+    tkey = None
+    for pk in _TYPE_PARAMS:
+        if pk in keys:
+            tkey = resolve_type_key(params.get(pk))
+            if tkey:
+                break
+    if tkey:
+        st.session_state.type = tkey
+        st.session_state.section = "create"
+        st.session_state.step = 1
+    t = get_type(tkey or st.session_state.type)
+    if t:
+        ns = t["key"] + "_"
+        bmap = {}
+        if t["kind"] == "freeze":
+            bmap = {"name": "client_name", "plan": "selected_plan", "start_date": "start",
+                    "orig_expiration": "exp", "break_start": "bstart", "break_days": "bdays",
+                    "break_end": "bend", "reason": "reason", "exhibit": "exhibit"}
+        elif t["kind"] == "extension":
+            bmap = {"name": "client_name", "plan": "selected_plan", "start_date": "start",
+                    "current_expiration": "exp", "extension_months": "months", "exhibit": "exhibit"}
+        for tok in keys:
+            if tok in _TYPE_PARAMS:
+                continue
+            v = var_get(tok)
+            val = _conv_param(params.get(tok), v["type"])
+            if val is None:
+                continue
+            if t["kind"] in ("freeze", "extension"):
+                if tok in bmap:
+                    st.session_state[ns + bmap[tok]] = val
+                    if tok in ("orig_expiration", "current_expiration"):
+                        st.session_state[ns + "exp_touched"] = True
+                    if tok == "break_end":
+                        st.session_state[ns + "mode"] = "По дате окончания"
+                    if tok == "break_days":
+                        st.session_state[ns + "mode"] = "По количеству дней"
+                else:
+                    st.session_state[ns + "x_" + tok] = val
+            else:
+                st.session_state[ns + tok] = val
+                if v.get("default_expr"):
+                    st.session_state[ns + tok + "_touched"] = True
+    st.session_state["_prefilled"] = True
+
+
+apply_prefill()
+
+
 def goto(tk, section):
     if tk != st.session_state.type:
         st.session_state.step = 1
@@ -878,6 +1008,35 @@ with st.sidebar:
     label = {"gsheets": "🟢 Google-таблица", "local": "🟡 локально (сбросится при перезапуске)",
              "empty": "🟡 локально"}.get(src, src)
     st.caption(f"Хранение: {label}")
+    if storage.gdrive_configured():
+        st.caption("📁 Созданные файлы выгружаются в Google Drive")
+    if src != "gsheets":
+        st.caption("⚠️ Данные не сохраняются между перезапусками. Подключи Google-таблицу, "
+                   "чтобы шаблоны не пропадали.")
+        if storage.gsheets_configured():
+            with st.expander("🔌 Проверить подключение к Google"):
+                if st.button("Проверить сейчас", use_container_width=True, key="gcheck"):
+                    ok_s, msg_s = storage.check_gsheets()
+                    (st.success if ok_s else st.error)(f"Таблица: {msg_s}")
+                    if storage.gdrive_configured():
+                        ok_d, msg_d = storage.check_gdrive()
+                        (st.success if ok_d else st.error)(f"Drive: {msg_d}")
+                    if ok_s:
+                        st.info("Подключение есть. Нажми «Reboot app», чтобы переключиться на 🟢.")
+    if admin_unlocked():
+        with st.expander("💾 Резервная копия"):
+            st.download_button("⬇️ Скачать копию (.json)",
+                               json.dumps(D(), ensure_ascii=False, indent=2),
+                               file_name="go-offer-backup.json", mime="application/json",
+                               use_container_width=True)
+            up = st.file_uploader("Восстановить из копии (.json)", type=["json"], key="bk_up")
+            if up is not None and st.button("Загрузить эту копию", use_container_width=True, key="bk_load"):
+                try:
+                    st.session_state.data = json.loads(up.getvalue().decode("utf-8"))
+                    save_data(); st.success("Восстановлено из копии."); st.rerun()
+                except Exception as e:
+                    st.error(f"Не удалось прочитать файл: {e}")
+            st.caption("Восстановление заменяет все текущие данные данными из файла.")
 
 # ---------------- контент ----------------
 types_now = all_types()
@@ -1017,14 +1176,37 @@ if sec == "create":
                 st.caption("нет PDF")
         with b4:
             if st.button("💾 Сохранить", type="primary", use_container_width=True):
-                D()["saved"].setdefault(t["key"], []).insert(0, {
+                entry = {
                     "client": client or "—", "date": date.today().strftime(E.DATE_FMT),
                     "created_iso": date.today().isoformat(),
                     "type_name": t["name"], "text": text_of(t["key"]), "ctx": ctx,
                     "sig": sig,
                     "form": st.session_state.get("cur_form", {}),
-                    "extra": st.session_state.get("cur_extra", {})})
-                save_data(); st.success("Сохранено в «созданные документы».")
+                    "extra": st.session_state.get("cur_extra", {})}
+                if storage.gdrive_configured():
+                    try:
+                        link = storage.upload_to_drive(
+                            fname + ".docx", docx_bytes,
+                            "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                        entry["drive_docx"] = link
+                        if E._find_soffice():
+                            try:
+                                pdfb = cached_pdf(text_of(t["key"]),
+                                                  json.dumps(ctx, ensure_ascii=False), client, sig)
+                                entry["drive_pdf"] = storage.upload_to_drive(
+                                    fname + ".pdf", pdfb, "application/pdf")
+                            except Exception:
+                                pass
+                        st.success("Сохранено и выгружено в Google Drive.")
+                        if link:
+                            st.markdown(f"[Открыть документ в Google Drive]({link})")
+                    except Exception as e:
+                        st.success("Сохранено в «созданные документы».")
+                        st.warning(f"Не удалось выгрузить в Google Drive: {e}")
+                else:
+                    st.success("Сохранено в «созданные документы».")
+                D()["saved"].setdefault(t["key"], []).insert(0, entry)
+                save_data()
 
 # ===== ШАБЛОН =====
 elif sec == "template":
@@ -1060,6 +1242,12 @@ elif sec == "template":
                 save_data(); st.rerun()
     elif ret is not None:
         D()["texts"][t["key"]] = ret
+
+    with st.expander("🔗 Ссылка для предзаполнения формы"):
+        st.caption("Скопируй ссылку и замени метки после «=» на реальные значения "
+                   "(даты — в формате ГГГГ-ММ-ДД, пробелы кодируются как %20). "
+                   "Переход по ссылке откроет «создать документ» с заполненными полями.")
+        st.code(prefill_link(t), language=None)
 
     with st.expander("➕ Создать новую переменную"):
         st.caption("Создай переменную — затем кликни её в списке справа, чтобы вставить в текст.")
@@ -1269,8 +1457,11 @@ elif sec == "created":
         for i, e in shown:
             with st.container(border=True):
                 c = st.columns([4, 1, 1, 1, 1])
-                c[0].markdown(f"**{e['client']}**  \n<span style='color:gray;font-size:12px'>"
-                              f"создан: {e['date']} · {e['type_name']}</span>", unsafe_allow_html=True)
+                c0 = f"**{e['client']}**  \n<span style='color:gray;font-size:12px'>" \
+                     f"создан: {e['date']} · {e['type_name']}</span>"
+                if e.get("drive_docx"):
+                    c0 += f"  \n<a href='{e['drive_docx']}' target='_blank' style='font-size:12px'>📁 в Google Drive</a>"
+                c[0].markdown(c0, unsafe_allow_html=True)
                 client = e["ctx"].get("name", e.get("client", ""))
                 esig = e.get("sig", sig_enabled(t))
                 docx_bytes = E.build_docx(e["text"], e["ctx"], client, with_signature=esig)
