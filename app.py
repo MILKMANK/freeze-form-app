@@ -269,11 +269,12 @@ def needed_tokens(t):
     """Замыкание переменных, реально нужных для текста: сами токены из текста +
        всё, от чего зависят формулы / вычисляемые даты / значения по умолчанию."""
     txt = text_of(t["key"]) or ""
+    valid = {v["token"] for v in variables()}
     needed = set()
     frontier = [v["token"] for v in variables() if ("{" + v["token"] + "}") in txt]
     while frontier:
         tok = frontier.pop()
-        if tok in needed:
+        if tok in needed or tok not in valid:
             continue
         needed.add(tok)
         v = var_get(tok)
@@ -285,7 +286,7 @@ def needed_tokens(t):
         if v.get("default_expr"):
             refs += E.refs_in(v.get("default_expr", ""))
         for r in refs:
-            if r and r not in needed:
+            if r and r in valid and r not in needed:
                 frontier.append(r)
     return needed
 
@@ -410,12 +411,23 @@ def linked_expiration(ns, start_key, label):
     return st.date_input(label, key=exp_key, on_change=_mark, args=(tch,))
 
 
-def compute_default(expr, ns, out_type):
-    """Значение по умолчанию из формулы, опираясь на другие поля (по их ключам ns+token)."""
+def _value_key(t, ns, tok):
+    """Ключ session_state для значения переменной с учётом типа формы."""
+    if _uses_base_form(t):
+        bmap = {"name": "client_name", "plan": "selected_plan", "start_date": "start",
+                "orig_expiration": "exp", "current_expiration": "exp", "break_start": "bstart",
+                "break_days": "bdays", "break_end": "bend", "extension_months": "months",
+                "reason": "reason", "exhibit": "exhibit"}
+        return ns + bmap.get(tok, "x_" + tok)
+    return ns + tok
+
+
+def compute_default(t, expr, ns, out_type):
+    """Значение по умолчанию из формулы, опираясь на текущие значения других полей."""
     try:
         env = {}
         for ref in E.refs_in(expr):
-            v = st.session_state.get(ns + ref)
+            v = st.session_state.get(_value_key(t, ns, ref))
             if isinstance(v, date):
                 env[ref] = float(v.toordinal())
             elif isinstance(v, bool):
@@ -437,24 +449,43 @@ def compute_default(expr, ns, out_type):
 def _render_extra(t, ns):
     extra = {}
     toks = [tk for tk in extra_tokens(t)]
-    shown = [tk for tk in toks if var_get(tk)["type"] not in ("calc_date", "formula")]
-    if shown:
+    inputs = [tk for tk in toks if var_get(tk)["type"] not in ("calc_date", "formula")]
+    if inputs:
         st.markdown("**Дополнительные поля**")
-    for tok in toks:
-        v = var_get(tok)
-        tp = v["type"]
-        if tp in ("calc_date", "formula"):
-            continue  # вычисляется автоматически
-        key = ns + "x_" + tok
+
+    def _render(tok):
+        v = var_get(tok); tp = v["type"]; key = ns + "x_" + tok
+        dx = v.get("default_expr")
         if tp == "date":
-            _ensure(key, date.today())
-            extra[tok] = st.date_input(v["label"], key=key)
+            if dx:
+                tk = key + "_touched"; dflt = compute_default(t, dx, ns, "date")
+                _ensure(key, dflt); _ensure(tk, False)
+                if not st.session_state[tk]:
+                    st.session_state[key] = dflt
+                extra[tok] = st.date_input(v["label"], key=key, on_change=_mark, args=(tk,))
+            else:
+                _ensure(key, date.today())
+                extra[tok] = st.date_input(v["label"], key=key)
         elif tp in ("number", "dur_days", "dur_months"):
             lbl = v["label"] + (" (дней)" if tp == "dur_days" else " (мес.)" if tp == "dur_months" else "")
-            extra[tok] = st.number_input(lbl, value=None, step=1, key=key,
-                                         placeholder="число (пусто = 0)")
+            if dx:
+                tk = key + "_touched"; dflt = compute_default(t, dx, ns, "number")
+                _ensure(key, dflt); _ensure(tk, False)
+                if not st.session_state[tk]:
+                    st.session_state[key] = dflt
+                extra[tok] = st.number_input(lbl, step=1, key=key, on_change=_mark, args=(tk,))
+            else:
+                extra[tok] = st.number_input(lbl, value=None, step=1, key=key,
+                                             placeholder="число (пусто = 0)")
         else:
             extra[tok] = st.text_input(v["label"], key=key)
+
+    for tok in inputs:
+        if not var_get(tok).get("default_expr"):
+            _render(tok)
+    for tok in inputs:
+        if var_get(tok).get("default_expr"):
+            _render(tok)
     return extra
 
 
@@ -471,7 +502,10 @@ def render_form(t):
             _ensure(ns + "start", date.today())
             st.date_input("Дата создания Хаба", key=ns + "start")
         if kind == "freeze":
-            orig_exp = linked_expiration(ns, ns + "start", "Изнач. дата окончания (по умолч. +6 мес.)")
+            if "orig_expiration" in D().get("deleted_defaults", []):
+                orig_exp = E.add_months(st.session_state[ns + "start"], 6)
+            else:
+                orig_exp = linked_expiration(ns, ns + "start", "Изнач. дата окончания (по умолч. +6 мес.)")
             st.subheader("Параметры паузы")
             _ensure(ns + "bstart", date.today())
             st.date_input("Дата старта паузы", key=ns + "bstart")
@@ -495,7 +529,10 @@ def render_form(t):
                     "reason": st.session_state.get(ns + "reason", "")}
             return form, _render_extra(t, ns)
         else:
-            cur = linked_expiration(ns, ns + "start", "Текущая дата окончания (по умолч. +6 мес.)")
+            if "current_expiration" in D().get("deleted_defaults", []):
+                cur = E.add_months(st.session_state[ns + "start"], 6)
+            else:
+                cur = linked_expiration(ns, ns + "start", "Текущая дата окончания (по умолч. +6 мес.)")
             st.subheader("Параметры продления")
             st.number_input("Продлить на (месяцев)", 1, 120, 6, 1, key=ns + "months")
             form = {"exhibit": st.session_state[ns + "exhibit"],
@@ -516,7 +553,7 @@ def render_form(t):
             dx = f.get("default_expr")
             if tp == "date":
                 if dx:
-                    tk = key + "_touched"; dflt = compute_default(dx, ns, "date")
+                    tk = key + "_touched"; dflt = compute_default(t, dx, ns, "date")
                     _ensure(key, dflt); _ensure(tk, False)
                     if not st.session_state[tk]:
                         st.session_state[key] = dflt
@@ -527,7 +564,7 @@ def render_form(t):
             elif tp in ("number", "dur_days", "dur_months"):
                 lbl = f["label"] + (" (дней)" if tp == "dur_days" else " (мес.)" if tp == "dur_months" else "")
                 if dx:
-                    tk = key + "_touched"; dflt = compute_default(dx, ns, "number")
+                    tk = key + "_touched"; dflt = compute_default(t, dx, ns, "number")
                     _ensure(key, dflt); _ensure(tk, False)
                     if not st.session_state[tk]:
                         st.session_state[key] = dflt
@@ -1053,11 +1090,41 @@ with st.sidebar:
                     if ok_s:
                         st.info("Подключение есть. Нажми «Reboot app», чтобы переключиться на 🟢.")
     if admin_unlocked():
-        with st.expander("💾 Резервная копия"):
+        with st.expander("💾 Резервная копия", expanded=False):
             st.download_button("⬇️ Скачать копию (.json)",
                                json.dumps(D(), ensure_ascii=False, indent=2),
                                file_name="go-offer-backup.json", mime="application/json",
                                use_container_width=True)
+            # сохранить копию в папку Google Drive
+            def _bk_folder():
+                d = D().get("backup_folder")
+                if d:
+                    return d
+                try:
+                    return st.secrets["gdrive"].get("backup_folder") or st.secrets["gdrive"].get("folder")
+                except Exception:
+                    return ""
+            bf = st.text_input("Папка Google Drive для бэкапов (ID)", value=_bk_folder() or "",
+                               key="bk_folder", placeholder="ID папки из ссылки drive")
+            if bf != D().get("backup_folder", ""):
+                D()["backup_folder"] = bf; save_data()
+            if st.button("☁️ Сохранить копию в Google Drive", use_container_width=True, key="bk_drive"):
+                if not bf:
+                    st.error("Укажи ID папки для бэкапов.")
+                else:
+                    try:
+                        link = storage.upload_to_drive(
+                            f"backup-{date.today().isoformat()}.json",
+                            json.dumps(D(), ensure_ascii=False, indent=2).encode("utf-8"),
+                            "application/json", folder_id=bf)
+                        D()["last_backup"] = date.today().isoformat(); save_data()
+                        st.success("Копия сохранена в Google Drive.")
+                        if link:
+                            st.markdown(f"[Открыть копию]({link})")
+                    except Exception as e:
+                        st.error(f"Не удалось сохранить в Drive: {e}")
+            if D().get("last_backup"):
+                st.caption(f"Последняя копия в Drive: {fmt_iso(D()['last_backup'])}")
             up = st.file_uploader("Восстановить из копии (.json)", type=["json"], key="bk_up")
             if up is not None and st.button("Загрузить эту копию", use_container_width=True, key="bk_load"):
                 try:
@@ -1066,6 +1133,8 @@ with st.sidebar:
                 except Exception as e:
                     st.error(f"Не удалось прочитать файл: {e}")
             st.caption("Восстановление заменяет все текущие данные данными из файла.")
+    else:
+        st.caption("🔒 Резервная копия — после ввода пароля редактирования.")
 
 # ---------------- контент ----------------
 types_now = all_types()

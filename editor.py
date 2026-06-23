@@ -12,17 +12,18 @@ import streamlit.components.v1 as components
 
 _HTML = r"""<!doctype html><html><head><meta charset="utf-8">
 <style>
-  html,body{margin:0;padding:0;}
+  html,body{margin:0;padding:0;height:100%;}
   body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;}
-  .row{display:flex;gap:14px;align-items:flex-start;}
-  .left{flex:1;min-width:0;}
-  .right{width:330px;flex:none;}
-  .tb{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 6px;}
+  .row{display:flex;gap:14px;align-items:stretch;height:100%;}
+  .left{flex:1;min-width:0;display:flex;flex-direction:column;height:100%;}
+  .right{width:330px;flex:none;display:flex;flex-direction:column;height:100%;}
+  .tb{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 6px;flex:none;position:sticky;top:0;
+    background:#fff;z-index:5;padding-bottom:2px;}
   .tb button{border:1px solid #c9ccd1;background:#fff;border-radius:6px;padding:4px 10px;
     cursor:pointer;font-size:13px;color:#111;}
   .tb button:hover{background:#f3f4f6;}
-  .hint{font-size:11px;color:#16a34a;margin:0 0 6px;}
-  .editor{box-sizing:border-box;width:100%;min-height:380px;border:1px solid #c9ccd1;border-radius:8px;
+  .hint{font-size:11px;color:#16a34a;margin:0 0 6px;flex:none;}
+  .editor{box-sizing:border-box;width:100%;flex:1;min-height:0;border:1px solid #c9ccd1;border-radius:8px;
     padding:12px;font-family:Georgia,"Times New Roman",serif;font-size:14px;line-height:1.6;outline:none;
     white-space:pre-wrap;word-wrap:break-word;color:#1a1a1a;overflow:auto;}
   .editor:focus{border-color:#7c3aed;}
@@ -31,10 +32,10 @@ _HTML = r"""<!doctype html><html><head><meta charset="utf-8">
   .editor div,.editor p{margin:0;min-height:1.6em;}
   .tok{background:#ede9fe;color:#7c3aed;border-radius:4px;padding:0 3px;
     font-family:ui-monospace,monospace;font-size:12px;white-space:nowrap;}
-  .vtitle{font-size:13px;font-weight:600;color:#444;margin:0 0 6px;}
+  .vtitle{font-size:13px;font-weight:600;color:#444;margin:0 0 6px;flex:none;}
   .vsearch{width:100%;box-sizing:border-box;border:1px solid #d7dae0;border-radius:8px;
-    padding:6px 9px;font-size:12px;margin:0 0 8px;}
-  .vcol{display:flex;flex-direction:column;gap:6px;max-height:430px;overflow:auto;padding-right:2px;}
+    padding:6px 9px;font-size:12px;margin:0 0 8px;flex:none;}
+  .vcol{display:flex;flex-direction:column;gap:6px;flex:1;min-height:0;overflow:auto;padding-right:2px;}
   .chip{border:1px solid #d7dae0;background:#f6f7f9;border-radius:8px;padding:7px 9px;cursor:pointer;}
   .chip:hover{background:#eceff3;}
   .chip.dim{opacity:.55;background:#fafbfc;}
@@ -61,7 +62,7 @@ _HTML = r"""<!doctype html><html><head><meta charset="utf-8">
         <button data-b="h1" title="Заголовок (вся строка)">H1</button>
         <button data-b="h2" title="Подзаголовок (вся строка)">H2</button>
       </div>
-      <div class="hint">Ж / К — выдели текст в одной строке. H1 / H2 — встань на строку. Символы разметки не показываются (визуальный редактор v8).</div>
+      <div class="hint">Ж / К — выдели текст в одной строке. H1 / H2 — встань на строку. Символы разметки не показываются (визуальный редактор v9).</div>
       <div id="ed" class="editor" contenteditable="true" spellcheck="false"></div>
     </div>
     <div class="right">
@@ -78,7 +79,8 @@ _HTML = r"""<!doctype html><html><head><meta charset="utf-8">
 
   function post(type, extra){ var m={isStreamlitMessage:true,type:type};
     if(extra){for(var k in extra)m[k]=extra[k];} window.parent.postMessage(m,'*'); }
-  function setHeight(){ post('streamlit:setFrameHeight',{height:document.body.scrollHeight+8}); }
+  var FRAME_H = 600;
+  function setHeight(){ post('streamlit:setFrameHeight',{height:FRAME_H}); }
   function sendValue(){ post('streamlit:setComponentValue',
     {value:{text:currentMarkdown(), cmd:pendingCmd}, dataType:'json'}); pendingCmd=null; }
   function scheduleSend(){ clearTimeout(debTimer); debTimer=setTimeout(sendValue,350); }
@@ -264,7 +266,7 @@ _DIR = tempfile.mkdtemp(prefix="go_editor8_")
 with open(os.path.join(_DIR, "index.html"), "w", encoding="utf-8") as _f:
     _f.write(_HTML)
 
-_component = components.declare_component("go_template_editor_v8", path=_DIR)
+_component = components.declare_component("go_template_editor_v9", path=_DIR)
 
 
 def template_editor(text: str, variables, key=None):

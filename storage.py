@@ -59,8 +59,8 @@ def check_gdrive():
         return False, str(e)
 
 
-def upload_to_drive(filename: str, data: bytes, mime: str):
-    """Загружает файл в папку Google Drive (folder из secrets). Возвращает ссылку или None."""
+def upload_to_drive(filename: str, data: bytes, mime: str, folder_id: str = None):
+    """Загружает файл в папку Google Drive. Возвращает ссылку или None."""
     import io
     from google.oauth2.service_account import Credentials
     from googleapiclient.discovery import build
@@ -69,7 +69,7 @@ def upload_to_drive(filename: str, data: bytes, mime: str):
     creds = Credentials.from_service_account_info(
         info, scopes=["https://www.googleapis.com/auth/drive"])
     svc = build("drive", "v3", credentials=creds, cache_discovery=False)
-    folder = st.secrets["gdrive"]["folder"]
+    folder = folder_id or st.secrets["gdrive"]["folder"]
     meta = {"name": filename, "parents": [folder]}
     media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=False)
     f = svc.files().create(body=meta, media_body=media, fields="id,webViewLink",
