@@ -428,6 +428,7 @@ def compute_default(t, expr, ns, out_type):
         env = {}
         for ref in E.refs_in(expr):
             v = st.session_state.get(_value_key(t, ns, ref))
+            vt = var_get(ref).get("type")
             if isinstance(v, date):
                 env[ref] = float(v.toordinal())
             elif isinstance(v, bool):
@@ -435,7 +436,7 @@ def compute_default(t, expr, ns, out_type):
             elif isinstance(v, (int, float)):
                 env[ref] = float(v)
             elif v in (None, ""):
-                env[ref] = None
+                env[ref] = 0.0 if vt in ("number", "dur_days", "dur_months") else None
             else:
                 env[ref] = str(v)
         val = E.evaluate_formula(expr, env)
@@ -453,15 +454,29 @@ def _render_extra(t, ns):
     if inputs:
         st.markdown("**Дополнительные поля**")
 
+    # сначала пересчитываем поля с формулой-умолчанием в порядке зависимостей (итеративно)
+    defx_fields = [tk for tk in inputs if var_get(tk).get("default_expr")]
+    for _it in range(len(defx_fields) + 2):
+        any_change = False
+        for tok in defx_fields:
+            key = ns + "x_" + tok; tk = key + "_touched"
+            if st.session_state.get(tk):
+                continue
+            v = var_get(tok)
+            ot = "date" if v["type"] == "date" else "number"
+            dflt = compute_default(t, v["default_expr"], ns, ot)
+            if st.session_state.get(key) != dflt:
+                st.session_state[key] = dflt; any_change = True
+            _ensure(tk, False)
+        if not any_change:
+            break
+
     def _render(tok):
         v = var_get(tok); tp = v["type"]; key = ns + "x_" + tok
         dx = v.get("default_expr")
         if tp == "date":
             if dx:
-                tk = key + "_touched"; dflt = compute_default(t, dx, ns, "date")
-                _ensure(key, dflt); _ensure(tk, False)
-                if not st.session_state[tk]:
-                    st.session_state[key] = dflt
+                tk = key + "_touched"
                 extra[tok] = st.date_input(v["label"], key=key, on_change=_mark, args=(tk,))
             else:
                 _ensure(key, date.today())
@@ -469,10 +484,7 @@ def _render_extra(t, ns):
         elif tp in ("number", "dur_days", "dur_months"):
             lbl = v["label"] + (" (дней)" if tp == "dur_days" else " (мес.)" if tp == "dur_months" else "")
             if dx:
-                tk = key + "_touched"; dflt = compute_default(t, dx, ns, "number")
-                _ensure(key, dflt); _ensure(tk, False)
-                if not st.session_state[tk]:
-                    st.session_state[key] = dflt
+                tk = key + "_touched"
                 extra[tok] = st.number_input(lbl, step=1, key=key, on_change=_mark, args=(tk,))
             else:
                 extra[tok] = st.number_input(lbl, value=None, step=1, key=key,
@@ -481,11 +493,7 @@ def _render_extra(t, ns):
             extra[tok] = st.text_input(v["label"], key=key)
 
     for tok in inputs:
-        if not var_get(tok).get("default_expr"):
-            _render(tok)
-    for tok in inputs:
-        if var_get(tok).get("default_expr"):
-            _render(tok)
+        _render(tok)
     return extra
 
 
@@ -553,10 +561,7 @@ def render_form(t):
             dx = f.get("default_expr")
             if tp == "date":
                 if dx:
-                    tk = key + "_touched"; dflt = compute_default(t, dx, ns, "date")
-                    _ensure(key, dflt); _ensure(tk, False)
-                    if not st.session_state[tk]:
-                        st.session_state[key] = dflt
+                    tk = key + "_touched"
                     form[f["key"]] = st.date_input(f["label"], key=key, on_change=_mark, args=(tk,))
                 else:
                     _ensure(key, date.today())
@@ -564,10 +569,7 @@ def render_form(t):
             elif tp in ("number", "dur_days", "dur_months"):
                 lbl = f["label"] + (" (дней)" if tp == "dur_days" else " (мес.)" if tp == "dur_months" else "")
                 if dx:
-                    tk = key + "_touched"; dflt = compute_default(t, dx, ns, "number")
-                    _ensure(key, dflt); _ensure(tk, False)
-                    if not st.session_state[tk]:
-                        st.session_state[key] = dflt
+                    tk = key + "_touched"
                     form[f["key"]] = st.number_input(lbl, step=1, key=key, on_change=_mark, args=(tk,))
                 else:
                     form[f["key"]] = st.number_input(lbl, value=None, step=1, key=key,
@@ -575,11 +577,23 @@ def render_form(t):
             else:
                 form[f["key"]] = st.text_input(f["label"], key=key)
 
-        plain = [f for f in inputs if not f.get("default_expr")]
-        withdef = [f for f in inputs if f.get("default_expr")]
-        for f in plain:
-            _render_field(f)
-        for f in withdef:
+        # пересчёт полей с формулой-умолчанием в порядке зависимостей (итеративно)
+        defx = [f for f in inputs if f.get("default_expr")]
+        for _it in range(len(defx) + 2):
+            any_change = False
+            for f in defx:
+                key = ns + f["key"]; tk = key + "_touched"
+                if st.session_state.get(tk):
+                    continue
+                ot = "date" if f["type"] == "date" else "number"
+                dflt = compute_default(t, f["default_expr"], ns, ot)
+                if st.session_state.get(key) != dflt:
+                    st.session_state[key] = dflt; any_change = True
+                _ensure(tk, False)
+            if not any_change:
+                break
+
+        for f in inputs:
             _render_field(f)
         return form, {}
 
