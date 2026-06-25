@@ -541,13 +541,17 @@ def render_form(t):
                 cur = E.add_months(st.session_state[ns + "start"], 6)
             else:
                 cur = linked_expiration(ns, ns + "start", "Текущая дата окончания (по умолч. +6 мес.)")
-            st.subheader("Параметры продления")
-            st.number_input("Продлить на (месяцев)", 1, 120, 6, 1, key=ns + "months")
+            if "extension_months" in D().get("deleted_defaults", []):
+                ext_months = 0
+            else:
+                st.subheader("Параметры продления")
+                st.number_input("Продлить на (месяцев)", 1, 120, 6, 1, key=ns + "months")
+                ext_months = st.session_state[ns + "months"]
             form = {"exhibit": st.session_state[ns + "exhibit"],
                     "client_name": st.session_state[ns + "client_name"].strip(),
                     "selected_plan": st.session_state[ns + "selected_plan"].strip(),
                     "start_date": st.session_state[ns + "start"], "current_exp": cur,
-                    "ext_months": st.session_state[ns + "months"]}
+                    "ext_months": ext_months}
             return form, _render_extra(t, ns)
     else:
         form = {}
