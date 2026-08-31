@@ -663,22 +663,41 @@ def preview_html(text, ctx, client, with_table=True, highlight_vars=False):
             return ('<span style="background:#ede9fe;color:#7c3aed;border-radius:4px;'
                     'padding:0 4px;">' + _h.escape(str(val)) + '</span>')
         return _h.escape(str(val))
+
+    def _inline(content):
+        """escape + **жирный**/*курсив* + подстановка {переменных}."""
+        h = _h.escape(content)
+        h = re.sub(r"\*\*([^*]+?)\*\*", r"<strong>\1</strong>", h)
+        h = re.sub(r"\*([^*]+?)\*", r"<em>\1</em>", h)
+        h = re.sub(r"\{(\w+)\}", _repl, h)
+        return h
+
+    lines = [raw.rstrip("\r") for raw in (text or "").split("\n")]
     out = []
-    for raw in (text or "").split("\n"):
-        line = raw.rstrip("\r")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if E._is_table_row(line) and i + 1 < len(lines) and E._is_table_sep(lines[i + 1]):
+            header, rows, i = E._collect_table(lines, i)
+            cell_sty = "border:1px solid #000;padding:6px 8px;vertical-align:top;text-align:left;"
+            trs = "<tr>" + "".join(
+                f'<th style="{cell_sty}font-weight:bold;">{_inline(hc) or "&nbsp;"}</th>'
+                for hc in header) + "</tr>"
+            for row in rows:
+                trs += "<tr>" + "".join(
+                    f'<td style="{cell_sty}">{_inline(c) or "&nbsp;"}</td>' for c in row) + "</tr>"
+            out.append(f'<table style="border-collapse:collapse;width:100%;margin:8px 0;">{trs}</table>')
+            continue
         if line.startswith("## "):
             content, sty = line[3:], "font-weight:bold;margin:8px 0 2px;"
         elif line.startswith("# "):
             content, sty = line[2:], "text-align:center;font-weight:bold;font-size:15px;margin:2px 0;"
         elif line.strip() == "":
-            out.append('<div style="height:8px;"></div>'); continue
+            out.append('<div style="height:8px;"></div>'); i += 1; continue
         else:
             content, sty = line, "white-space:pre-wrap;line-height:1.5;"
-        h = _h.escape(content)
-        h = re.sub(r"\*\*([^*]+?)\*\*", r"<strong>\1</strong>", h)
-        h = re.sub(r"\*([^*]+?)\*", r"<em>\1</em>", h)
-        h = re.sub(r"\{(\w+)\}", _repl, h)
-        out.append(f'<div style="{sty}">{h or "&nbsp;"}</div>')
+        out.append(f'<div style="{sty}">{_inline(content) or "&nbsp;"}</div>')
+        i += 1
     body = "".join(out)
     if with_table:
         rows = [("<b>Provider</b>", "<b>Client</b>", 1),

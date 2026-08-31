@@ -519,6 +519,40 @@ def _parse_runs(line: str):
     return runs
 
 
+# ------------- таблицы данных в теле (GFM pipe) -------------
+# Блок таблицы = строка на "|" + следующая строка-разделитель ("| --- | --- |"),
+# затем строки данных. Одиночная "| a | b |" без разделителя таблицей НЕ считается.
+def _is_table_row(line: str) -> bool:
+    return line.strip().startswith("|")
+
+
+def _is_table_sep(line: str) -> bool:
+    s = line.strip()
+    return s.startswith("|") and "-" in s and bool(re.fullmatch(r"[|\-:\s]+", s))
+
+
+def _split_cells(line: str):
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip() for c in s.split("|")]
+
+
+def _collect_table(lines, i):
+    """i указывает на строку-заголовок, i+1 — разделитель. Возвращает
+    (header, rows, j) где j — индекс первой строки после таблицы."""
+    header = _split_cells(lines[i])
+    rows, j = [], i + 2
+    while j < len(lines) and _is_table_row(lines[j]) and not _is_table_sep(lines[j]):
+        rows.append(_split_cells(lines[j]))
+        j += 1
+    n = len(header)
+    norm = lambda c: (c + [""] * n)[:n]  # выровнять число ячеек к заголовку
+    return header, [norm(r) for r in rows], j
+
+
 def _add_runs(p, line: str, ctx: dict, base_bold=False, size=None):
     for seg, bold, ital in _parse_runs(line):
         r = p.add_run(_sub(seg, ctx))
@@ -567,6 +601,24 @@ def _signature_table(doc, client_name: str):
     return table
 
 
+def _add_data_table(doc, header, rows, ctx):
+    """Настоящая таблица с рамками. Ячейки поддерживают {переменные} и **жирный**/*курсив*."""
+    table = doc.add_table(rows=1 + len(rows), cols=len(header))
+    table.autofit = True
+    _set_table_borders(table)
+    for ci, htext in enumerate(header):
+        cell = table.cell(0, ci)
+        cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.LEFT
+        _add_runs(cell.paragraphs[0], htext, ctx, base_bold=True)
+    for ri, row in enumerate(rows, start=1):
+        for ci, val in enumerate(row):
+            cell = table.cell(ri, ci)
+            cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.LEFT
+            _add_runs(cell.paragraphs[0], val, ctx)
+    doc.add_paragraph()
+    return table
+
+
 def build_docx(text: str, ctx: dict, client_name: str, with_signature: bool = True) -> bytes:
     doc = Document()
     style = doc.styles["Normal"]
@@ -578,8 +630,14 @@ def build_docx(text: str, ctx: dict, client_name: str, with_signature: bool = Tr
     sec.page_width, sec.page_height = Inches(8.5), Inches(11)
     sec.top_margin = sec.bottom_margin = sec.left_margin = sec.right_margin = Inches(1)
 
-    for raw in (text or "").split("\n"):
-        line = raw.rstrip("\r")
+    lines = [raw.rstrip("\r") for raw in (text or "").split("\n")]
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if _is_table_row(line) and i + 1 < len(lines) and _is_table_sep(lines[i + 1]):
+            header, rows, i = _collect_table(lines, i)
+            _add_data_table(doc, header, rows, ctx)
+            continue
         if line.startswith("## "):
             p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.LEFT
             p.paragraph_format.space_before = Pt(6)
@@ -592,6 +650,7 @@ def build_docx(text: str, ctx: dict, client_name: str, with_signature: bool = Tr
         else:
             p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.LEFT
             _add_runs(p, line, ctx)
+        i += 1
 
     if with_signature:
         doc.add_paragraph()
