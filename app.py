@@ -672,13 +672,19 @@ def preview_html(text, ctx, client, with_table=True, highlight_vars=False):
         h = re.sub(r"\{(\w+)\}", _repl, h)
         return h
 
+    # Устойчивость к рассинхрону деплоя: если engine ещё старый (без функций
+    # таблиц), детекторы дают False — preview не падает, таблицы рендерятся текстом.
+    _is_row = getattr(E, "_is_table_row", lambda _l: False)
+    _is_sep = getattr(E, "_is_table_sep", lambda _l: False)
+    _collect = getattr(E, "_collect_table", None)
+
     lines = [raw.rstrip("\r") for raw in (text or "").split("\n")]
     out = []
     i = 0
     while i < len(lines):
         line = lines[i]
-        if E._is_table_row(line) and i + 1 < len(lines) and E._is_table_sep(lines[i + 1]):
-            header, rows, i = E._collect_table(lines, i)
+        if _collect and _is_row(line) and i + 1 < len(lines) and _is_sep(lines[i + 1]):
+            header, rows, i = _collect(lines, i)
             cell_sty = "border:1px solid #000;padding:6px 8px;vertical-align:top;text-align:left;"
             trs = "<tr>" + "".join(
                 f'<th style="{cell_sty}font-weight:bold;">{_inline(hc) or "&nbsp;"}</th>'
