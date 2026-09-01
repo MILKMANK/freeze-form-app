@@ -553,9 +553,56 @@ def _collect_table(lines, i):
     return header, [norm(r) for r in rows], j
 
 
+# markdown-ссылка [текст](url); url без пробелов и закрывающей скобки
+_LINK_RE = re.compile(r"\[([^\]]+)\]\((\S+?)\)")
+
+
+def _add_hyperlink(paragraph, url: str, text: str, size=None):
+    """Add a real clickable hyperlink run (w:hyperlink) to the paragraph."""
+    part = paragraph.part
+    r_id = part.relate_to(
+        url,
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink",
+        is_external=True,
+    )
+    link = OxmlElement("w:hyperlink")
+    link.set(qn("r:id"), r_id)
+    run = OxmlElement("w:r")
+    rpr = OxmlElement("w:rPr")
+    color = OxmlElement("w:color")
+    color.set(qn("w:val"), "0563C1")
+    rpr.append(color)
+    underline = OxmlElement("w:u")
+    underline.set(qn("w:val"), "single")
+    rpr.append(underline)
+    if size:
+        sz = OxmlElement("w:sz")
+        sz.set(qn("w:val"), str(int(size * 2)))  # half-points
+        rpr.append(sz)
+    run.append(rpr)
+    text_el = OxmlElement("w:t")
+    text_el.text = text
+    run.append(text_el)
+    link.append(run)
+    paragraph._p.append(link)
+
+
 def _add_runs(p, line: str, ctx: dict, base_bold=False, size=None):
-    for seg, bold, ital in _parse_runs(line):
-        r = p.add_run(_sub(seg, ctx))
+    """Render a line: split off [text](url) links first, then bold/italic runs."""
+    line = _sub(line, ctx)  # substitute variables before link/emphasis parsing
+    pos = 0
+    for m in _LINK_RE.finditer(line):
+        if m.start() > pos:
+            _add_emphasis_runs(p, line[pos:m.start()], base_bold, size)
+        _add_hyperlink(p, m.group(2), m.group(1), size=size)
+        pos = m.end()
+    if pos < len(line):
+        _add_emphasis_runs(p, line[pos:], base_bold, size)
+
+
+def _add_emphasis_runs(p, text: str, base_bold=False, size=None):
+    for seg, bold, ital in _parse_runs(text):
+        r = p.add_run(seg)
         r.bold = bold or base_bold
         r.italic = ital
         if size:

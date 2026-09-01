@@ -664,9 +664,14 @@ def preview_html(text, ctx, client, with_table=True, highlight_vars=False):
                     'padding:0 4px;">' + _h.escape(str(val)) + '</span>')
         return _h.escape(str(val))
 
+    def _link(m):
+        # content is already HTML-escaped, so text/url are safe to inline.
+        return f'<a href="{m.group(2)}" target="_blank">{m.group(1)}</a>'
+
     def _inline(content):
-        """escape + **жирный**/*курсив* + подстановка {переменных}."""
+        """escape + [текст](url) ссылки + **жирный**/*курсив* + подстановка {переменных}."""
         h = _h.escape(content)
+        h = re.sub(r"\[([^\]]+)\]\((\S+?)\)", _link, h)
         h = re.sub(r"\*\*([^*]+?)\*\*", r"<strong>\1</strong>", h)
         h = re.sub(r"\*([^*]+?)\*", r"<em>\1</em>", h)
         h = re.sub(r"\{(\w+)\}", _repl, h)
