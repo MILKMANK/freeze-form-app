@@ -90,6 +90,30 @@ def test_regression_freeze_and_ext_have_only_signature():
         assert len(doc.tables) == 1, "во встроенных типах только таблица подписей"
 
 
+def test_docx_hyperlink_is_clickable():
+    text = "**[Raise an issue](https://t.me/go_offerIrina)**"
+    doc = Document(io.BytesIO(E.build_docx(text, {}, "X", with_signature=False)))
+    xml = doc.element.xml
+    assert "hyperlink" in xml, "документ должен содержать w:hyperlink"
+    targets = [r.target_ref for r in doc.part.rels.values() if "hyperlink" in r.reltype]
+    assert "https://t.me/go_offerIrina" in targets
+    full = "\n".join(p.text for p in doc.paragraphs)
+    assert "Raise an issue" in full
+
+
+def test_link_with_variable_substitution():
+    text = "See [our hub]({link}) now."
+    doc = Document(io.BytesIO(E.build_docx(text, {"link": "https://hub/x"}, "X", with_signature=False)))
+    targets = [r.target_ref for r in doc.part.rels.values() if "hyperlink" in r.reltype]
+    assert "https://hub/x" in targets, "переменная в url должна подставиться до парсинга ссылки"
+
+
+def test_plain_text_without_link_unaffected():
+    doc = Document(io.BytesIO(E.build_docx("Just **bold** text", {}, "X", with_signature=False)))
+    assert "hyperlink" not in doc.element.xml
+    assert "bold" in "\n".join(p.text for p in doc.paragraphs)
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0
