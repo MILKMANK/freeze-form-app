@@ -664,18 +664,40 @@ def preview_html(text, ctx, client, with_table=True, highlight_vars=False):
                     'padding:0 4px;">' + _h.escape(str(val)) + '</span>')
         return _h.escape(str(val))
 
-    def _link(m):
-        # content is already HTML-escaped, so text/url are safe to inline.
-        return f'<a href="{m.group(2)}" target="_blank">{m.group(1)}</a>'
+    def _sub_url(m):
+        # URL value: raw substitution, never wrapped in a highlight span
+        # (a span inside href="..." would break the link). Mirrors the engine,
+        # which substitutes variables before parsing links.
+        tok = m.group(1)
+        return _h.escape(str(ctx.get(tok, m.group(0))))
 
-    def _inline(content):
-        """escape + [текст](url) ссылки + **жирный**/*курсив* + подстановка {переменных}."""
-        h = _h.escape(content)
-        h = re.sub(r"\[([^\]]+)\]\((\S+?)\)", _link, h)
+    def _emphasis(h):
         h = re.sub(r"\*\*([^*]+?)\*\*", r"<strong>\1</strong>", h)
         h = re.sub(r"\*([^*]+?)\*", r"<em>\1</em>", h)
-        h = re.sub(r"\{(\w+)\}", _repl, h)
-        return h
+        return re.sub(r"\{(\w+)\}", _repl, h)
+
+    def _link(m):
+        # Resolve the url without highlight (so {var} in the url becomes a clean
+        # href), and render the link text through the normal emphasis pipeline.
+        url = re.sub(r"\{(\w+)\}", _sub_url, _h.escape(m.group(2)))
+        label = _emphasis(_h.escape(m.group(1)))
+        return f'<a href="{url}" target="_blank">{label}</a>'
+
+    def _inline(content):
+        """escape + [текст](url) ссылки + **жирный**/*курсив* + подстановка {переменных}.
+
+        Links are parsed on the RAW (pre-escaped) text so the url {var} is
+        substituted cleanly, matching engine._add_runs (variables first)."""
+        parts = []
+        pos = 0
+        for m in re.finditer(r"\[([^\]]+)\]\((\S+?)\)", content):
+            if m.start() > pos:
+                parts.append(_emphasis(_h.escape(content[pos:m.start()])))
+            parts.append(_link(m))
+            pos = m.end()
+        if pos < len(content):
+            parts.append(_emphasis(_h.escape(content[pos:])))
+        return "".join(parts)
 
     # Устойчивость к рассинхрону деплоя: если engine ещё старый (без функций
     # таблиц), детекторы дают False — preview не падает, таблицы рендерятся текстом.

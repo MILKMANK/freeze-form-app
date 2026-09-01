@@ -114,6 +114,51 @@ def test_plain_text_without_link_unaffected():
     assert "bold" in "\n".join(p.text for p in doc.paragraphs)
 
 
+def _load_preview_html():
+    """Extract preview_html from app.py in isolation (app.py can't be imported —
+    it runs Streamlit UI code at module top level). Parse the AST, exec only that
+    function definition with engine E available as a global (it uses E.* getattr)."""
+    import ast
+    import textwrap
+    app_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py")
+    src = open(app_path, encoding="utf-8").read()
+    tree = ast.parse(src)
+    fn = next(n for n in tree.body
+              if isinstance(n, ast.FunctionDef) and n.name == "preview_html")
+    ns = {"E": E}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), app_path, "exec"), ns)
+    return ns["preview_html"]
+
+
+def test_preview_link_template_mode_keeps_clean_href():
+    """In template mode (highlight_vars=True) the raise-issue link must render as
+    a real <a href="{raise_issue_link}"> — the url must NOT be wrapped in a
+    highlight <span> (that was the bug: span leaked into href)."""
+    preview_html = _load_preview_html()
+    text = "**[Raise an issue]({raise_issue_link})**"
+    html = preview_html(text, {}, "", with_table=False, highlight_vars=True)
+    assert 'href="{raise_issue_link}"' in html, html
+    href = html.split('href="', 1)[1].split('"', 1)[0]
+    assert "<span" not in href, f"no highlight span inside href, got: {href}"
+    assert ">Raise an issue</a>" in html
+
+
+def test_preview_link_create_mode_substitutes_url():
+    preview_html = _load_preview_html()
+    text = "**[Raise an issue]({raise_issue_link})**"
+    html = preview_html(text, {"raise_issue_link": "https://t.me/go_offerIrina"},
+                        "", with_table=False, highlight_vars=False)
+    assert 'href="https://t.me/go_offerIrina"' in html, html
+    assert ">Raise an issue</a>" in html
+
+
+def test_preview_link_with_var_in_text():
+    preview_html = _load_preview_html()
+    html = preview_html("See [our hub]({HUB_LINK}) now.", {"HUB_LINK": "https://hub/x"},
+                        "", with_table=False, highlight_vars=False)
+    assert 'href="https://hub/x"' in html, html
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0
