@@ -1,3 +1,4 @@
+# Streamlit Cloud rebuild requested 2026-10-20 to retry template storage loading.
 streamlit>=1.33
 python-docx>=1.1
 gspread>=6.0
